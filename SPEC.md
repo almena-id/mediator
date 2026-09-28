@@ -512,7 +512,7 @@ Sending a push needs the credentials of the app that owns the token, which belon
 
 ## Appendix G. Deployment and configuration
 
-TLS is terminated by a reverse proxy. The first public mediator is `https://mediator.almena.network` (`did:web:mediator.almena.network`); its deployment waits until the wallet needs it. Development runs at `https://mediator.dev.almena.network` (Caddy with a Let's Encrypt certificate over DNS-01 delegated to acme-dns, `compose.yml`). The domain is not fixed anywhere: `ALMENA_DOMAIN` names it for Compose, the Caddyfile and Task, and `.env.example` derives `ALMENA_PUBLIC_URL`, `ALMENA_TURN_URLS` and `ALMENA_TURN_REALM` from it.
+TLS is terminated by a reverse proxy. The first public mediator is `https://mediator.almena.network` (`did:web:mediator.almena.network`); its deployment waits until the wallet needs it. Development runs at `https://mediator.dev.almena.network` (Caddy with a Let's Encrypt certificate over DNS-01 in the domain's Cloudflare zone, `compose.yml`). The domain is not fixed anywhere: `ALMENA_DOMAIN` names it for Compose, the Caddyfile and Task, and `.env.example` derives `ALMENA_PUBLIC_URL`, `ALMENA_TURN_URLS` and `ALMENA_TURN_REALM` from it.
 
 Settings beyond §11, all `ALMENA_*` environment variables (full list in [.env.example](.env.example)):
 

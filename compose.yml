@@ -56,11 +56,11 @@ services:
       start_period: 5s
 
   caddy:
-    # Caddy with the acme-dns module, for the DNS-01 challenge (Caddyfile).
+    # Caddy with the Cloudflare DNS module, for the DNS-01 challenge (Caddyfile).
     build:
       dockerfile_inline: |
         FROM caddy:2-builder-alpine AS builder
-        RUN xcaddy build --with github.com/caddy-dns/acmedns
+        RUN xcaddy build --with github.com/caddy-dns/cloudflare
         FROM caddy:2-alpine
         COPY --from=builder /usr/bin/caddy /usr/bin/caddy
     image: almena-caddy:dev
@@ -68,13 +68,13 @@ services:
     environment:
       # The Caddyfile's site.
       ALMENA_DOMAIN: ${ALMENA_DOMAIN:-}
+      # Writes the challenge's TXT record in the domain's Cloudflare zone.
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # acme-dns credentials (secrets/acme-dns.json, from `task acme-dns`).
-      - ./secrets:/secrets:ro
       # Certificates and the ACME account, on the host (git-ignored) so they
       # survive removing the containers and their volumes.
       - ./caddy:/data

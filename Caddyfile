@@ -1,10 +1,11 @@
 # HTTPS in front of the mediator for development, with a Let's Encrypt
 # certificate: the wallet trusts only the public roots. The DNS-01 challenge is
-# delegated to acme-dns (`task acme-dns`), so the machine need not be reachable.
-# The site is ALMENA_DOMAIN (.env), passed in by compose.yml.
+# answered in the domain's Cloudflare zone (CLOUDFLARE_API_TOKEN), so the
+# machine need not be reachable. The site is ALMENA_DOMAIN (.env), passed in by
+# compose.yml.
 {$ALMENA_DOMAIN} {
 	tls {
-		dns acmedns /secrets/acme-dns.json
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
 		# Check the challenge record through public resolvers: a local ISP
 		# resolver can cache NXDOMAIN for it and Caddy then never sees it land.
 		resolvers 1.1.1.1 8.8.8.8

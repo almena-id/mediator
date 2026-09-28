@@ -107,26 +107,6 @@ tasks:
     cmds:
       - docker compose up --build --detach --wait
 
-  acme-dns:
-    desc: Register with acme-dns for Caddy's Let's Encrypt certificate and print the CNAME to create by hand
-    cmds:
-      - mkdir -p secrets
-      - >-
-        curl --fail --silent --show-error -X POST https://auth.acme-dns.io/register
-        | jq '{username, password, subdomain, server_url: "https://auth.acme-dns.io", fulldomain}'
-        > secrets/acme-dns.json
-      - task: acme-dns:cname
-    status:
-      - test -f secrets/acme-dns.json
-
-  acme-dns:cname:
-    desc: Print the CNAME that delegates the DNS-01 challenge for ALMENA_DOMAIN to acme-dns
-    requires:
-      vars: [ALMENA_DOMAIN]
-    cmds:
-      - 'echo "_acme-challenge.{{.ALMENA_DOMAIN}}  CNAME  $(jq -r .fulldomain secrets/acme-dns.json)"'
-    silent: true
-
   down:
     desc: Stop and remove the Docker containers
     cmds:
