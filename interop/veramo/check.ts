@@ -5,7 +5,7 @@
 // and unpacked by Veramo; only the HTTP POST is ours, because Veramo's own
 // transport does not read `return_route` replies.
 //
-//   MEDIATOR_DID=did:web:mediator.dev.almena.network node check.ts
+//   MEDIATOR_DID=did:web:mediator.almena.id node check.ts
 //   ALMENA_DOMAIN=mediator.example.org node check.ts   (did:web of that domain)
 //
 // Exit code 0 when every required step passes.
@@ -29,7 +29,7 @@ import { getResolver as webResolver } from 'web-did-resolver'
 import { randomUUID } from 'node:crypto'
 
 const MEDIATOR =
-  process.env.MEDIATOR_DID ?? `did:web:${process.env.ALMENA_DOMAIN ?? 'mediator.dev.almena.network'}`
+  process.env.MEDIATOR_DID ?? `did:web:${process.env.ALMENA_DOMAIN ?? 'mediator.almena.id'}`
 const SPEC_ENC = { enc: 'A256CBC-HS512' } // what DIDComm v2.0 requires for authcrypt
 const MEDIA_TYPE = 'application/didcomm-encrypted+json'
 

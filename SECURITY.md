@@ -36,7 +36,7 @@ In scope, among others:
 
 Out of scope:
 
-- the development setup (`compose.yml`, e.g. `mediator.dev.almena.network`) (a local CA, no
+- the development setup (`compose.yml`, e.g. `mediator.almena.id`) (a local CA, no
   authentication on Redis by default);
 - denial of service that needs more traffic than the configured rate limits
   let through;

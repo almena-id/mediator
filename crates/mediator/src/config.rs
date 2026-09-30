@@ -466,7 +466,7 @@ mod tests {
             ("ALMENA_APNS_KEY_PATH", "/secrets/apns.p8"),
             ("ALMENA_APNS_KEY_ID", "KEY1234567"),
             ("ALMENA_APNS_TEAM_ID", "TEAM123456"),
-            ("ALMENA_APNS_TOPIC", "network.almena.wallet"),
+            ("ALMENA_APNS_TOPIC", "id.almena.wallet"),
             ("ALMENA_APNS_SANDBOX", "true"),
         ]))
         .unwrap();
@@ -477,7 +477,7 @@ mod tests {
             Some(PathBuf::from("/secrets/fcm.json"))
         );
         let apns = config.push.apns.unwrap();
-        assert_eq!(apns.topic, "network.almena.wallet");
+        assert_eq!(apns.topic, "id.almena.wallet");
         assert!(apns.sandbox);
     }
 

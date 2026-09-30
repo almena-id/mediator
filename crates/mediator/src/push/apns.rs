@@ -189,7 +189,7 @@ mod tests {
                      headers: HeaderMap,
                      Json(body): Json<Value>| async move {
                         a.requests.fetch_add(1, Ordering::SeqCst);
-                        assert_eq!(headers["apns-topic"], "network.almena.wallet");
+                        assert_eq!(headers["apns-topic"], "id.almena.wallet");
                         assert_eq!(headers["apns-push-type"], "alert");
                         assert_eq!(headers["apns-priority"], "10");
                         assert_eq!(headers["apns-collapse-id"], WAKE);
@@ -235,7 +235,7 @@ mod tests {
             key_path: "unused.p8".into(),
             key_id: "KEY1234567".into(),
             team_id: "TEAM123456".into(),
-            topic: "network.almena.wallet".into(),
+            topic: "id.almena.wallet".into(),
             sandbox: true,
         };
         let apns = Apns::with_key(KEY, &config, &url).unwrap();

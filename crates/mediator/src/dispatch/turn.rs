@@ -1,4 +1,4 @@
-//! TURN credentials (`https://almena.network/protocols/turn/1.0`, SPEC.md
+//! TURN credentials (`https://almena.id/protocols/turn/1.0`, SPEC.md
 //! §6.9): a mediated wallet asks for short-lived credentials for the TURN
 //! server its operator runs beside the mediator, so that its calls can be
 //! relayed. They are the time-limited credentials of the TURN REST API, which

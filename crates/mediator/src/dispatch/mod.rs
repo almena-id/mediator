@@ -1666,12 +1666,12 @@ mod tests {
             .request(
                 &on,
                 protocols::QUERIES,
-                json!({"queries": [{"feature-type": "protocol", "match": "https://almena.network/*"}]}),
+                json!({"queries": [{"feature-type": "protocol", "match": "https://almena.id/*"}]}),
             )
             .await;
         assert_eq!(
             disclose.body["disclosures"],
-            json!([{"feature-type": "protocol", "id": "https://almena.network/protocols/turn/1.0", "roles": ["server"]}])
+            json!([{"feature-type": "protocol", "id": "https://almena.id/protocols/turn/1.0", "roles": ["server"]}])
         );
     }
 

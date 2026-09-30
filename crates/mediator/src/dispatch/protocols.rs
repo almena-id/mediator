@@ -40,10 +40,10 @@ pub const DEVICE_INFO: &str = "device-info";
 pub const ACK: &str = "https://didcomm.org/notification/1.0/ack";
 
 /// TURN credentials, an Almena protocol (SPEC.md §6.9).
-pub const TURN: &str = "https://almena.network/protocols/turn/1.0/";
+pub const TURN: &str = "https://almena.id/protocols/turn/1.0/";
 pub const TURN_CREDENTIALS_REQUEST: &str =
-    "https://almena.network/protocols/turn/1.0/credentials-request";
-pub const TURN_CREDENTIALS: &str = "https://almena.network/protocols/turn/1.0/credentials";
+    "https://almena.id/protocols/turn/1.0/credentials-request";
+pub const TURN_CREDENTIALS: &str = "https://almena.id/protocols/turn/1.0/credentials";
 
 /// The push protocol of `service`, with the trailing `/` of a message type.
 pub fn push_protocol(service: Service) -> &'static str {

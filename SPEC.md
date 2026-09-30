@@ -267,7 +267,7 @@ Wallets place calls with [WebRTC][webrtc] and relay all their media through TURN
 
 | Protocol | PIURI | Messages |
 |---|---|---|
-| TURN 1.0 | `https://almena.network/protocols/turn/1.0` | `credentials-request`, `credentials` |
+| TURN 1.0 | `https://almena.id/protocols/turn/1.0` | `credentials-request`, `credentials` |
 
 The PIURI is a fixed name, the same for every deployment; only the TURN server's address varies (`ALMENA_TURN_URLS`).
 
@@ -370,7 +370,7 @@ TLS is terminated by a reverse proxy; the mediator speaks plain HTTP.
 | Push Notifications FCM 1.0 | `https://didcomm.org/push-notifications-fcm/1.0` | [FCM] | §6.3. |
 | Push Notifications APNs 1.0 | `https://didcomm.org/push-notifications-apns/1.0` | [APNs] | §6.3. |
 | ACK (notification) 1.0 | `https://didcomm.org/notification/1.0` | [Ack] | Emitted only, as the answer to `set-device-info`. |
-| TURN 1.0 | `https://almena.network/protocols/turn/1.0` | This document | §6.9. |
+| TURN 1.0 | `https://almena.id/protocols/turn/1.0` | This document | §6.9. |
 
 ## 10. Conformance evidence
 
@@ -450,7 +450,7 @@ Items were either **decided** explicitly or are **proposed** defaults that stand
 | **One instance** for now | Live sessions are in process. | App. E |
 | **Metrics on their own listener**, aggregate only | Never exposed through the public proxy; no DIDs. | App. H |
 | **TURN credentials from the mediator**, relay always | Calls never expose a wallet's IP to its contact; the operator who relays is the one the wallet already trusts; no second account. (2026-09-25) | §6.9 |
-| **Fixed Almena PIURIs** (`https://almena.network/protocols/…`) | No DIDComm protocol exists for this; a PIURI is a name compared as text, so it cannot vary per environment. (2026-09-25) | §6.9 |
+| **Fixed Almena PIURIs** (`https://almena.id/protocols/…`) | No DIDComm protocol exists for this; a PIURI is a name compared as text, so it cannot vary per environment. (2026-09-25) | §6.9 |
 
 ## Appendix B. Code layout and library
 
@@ -512,7 +512,7 @@ Sending a push needs the credentials of the app that owns the token, which belon
 
 ## Appendix G. Deployment and configuration
 
-TLS is terminated by a reverse proxy. The first public mediator is `https://mediator.almena.network` (`did:web:mediator.almena.network`); its deployment waits until the wallet needs it. Development runs at `https://mediator.dev.almena.network` (Caddy with a Let's Encrypt certificate over DNS-01 in the domain's Cloudflare zone, `compose.yml`). The domain is not fixed anywhere: `ALMENA_DOMAIN` names it for Compose, the Caddyfile and Task, and `.env.example` derives `ALMENA_PUBLIC_URL`, `ALMENA_TURN_URLS` and `ALMENA_TURN_REALM` from it.
+TLS is terminated by a reverse proxy. The first public mediator is `https://mediator.almena.id` (`did:web:mediator.almena.id`); its deployment waits until the wallet needs it. Development uses the same name, pointed at the developer's machine in `/etc/hosts` (Caddy with a Let's Encrypt certificate over DNS-01 in the domain's Cloudflare zone, `compose.yml`). The domain is not fixed anywhere: `ALMENA_DOMAIN` names it for Compose, the Caddyfile and Task, and `.env.example` derives `ALMENA_PUBLIC_URL`, `ALMENA_TURN_URLS` and `ALMENA_TURN_REALM` from it.
 
 Settings beyond §11, all `ALMENA_*` environment variables (full list in [.env.example](.env.example)):
 
