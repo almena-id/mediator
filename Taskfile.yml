@@ -97,6 +97,18 @@ tasks:
       - rm -rf interop/veramo/node_modules interop/veramo/caddy-root.crt
       - docker image rm -f {{.IMAGE}}
 
+  clean:all:
+    desc: Leave the repository as cloned — clean, plus the containers and their volumes, .env, the local keys, Caddy's certificates, the interop clients' packages and the Task checksums (the push credentials in secrets/ are kept)
+    prompt: Remove the containers and volumes (keys, Redis), .env, the local keys in data/ and Caddy's certificates? The mediator's DID changes with new keys.
+    cmds:
+      # By the project's name, away from compose.yml: it needs no .env, so a
+      # second run, or one after .env is gone, still works.
+      - cd / && docker compose --project-name almena-mediator down --volumes --remove-orphans
+      - task: clean
+      - rm -rf data caddy .task
+      - find interop -name node_modules -type d -prune -exec rm -rf {} +
+      - find . -maxdepth 1 -name '.env*' ! -name '.env.example' -exec rm -f {} +
+
   docker:build:
     desc: Build the Docker image
     cmds:
