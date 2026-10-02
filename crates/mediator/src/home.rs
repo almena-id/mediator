@@ -78,9 +78,9 @@ h1,h2,h3{font-family:var(--font-brand)}
 code{font-family:var(--font-mono);overflow-wrap:anywhere}
 a{color:inherit}
 .frame{width:100%;max-width:var(--page-width);margin-inline:auto;padding-inline:var(--gutter);box-sizing:border-box}
-.mark{flex:none;color:var(--brand)}
+.mark{flex:none;display:flex;color:var(--brand)}
 header{position:sticky;top:0;z-index:10;border-bottom:1px solid var(--border);background:rgba(15,16,19,.8);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px)}
-header .frame{display:flex;align-items:center;gap:1rem;padding-block:.75rem}
+header .frame{display:flex;align-items:center;gap:1rem;min-height:3.5rem;padding-block:.75rem}
 .wordmark{display:inline-flex;align-items:center;gap:.625rem;font-family:var(--font-brand);font-size:17px;letter-spacing:-.025em;white-space:nowrap;text-decoration:none}
 .wordmark strong{font-weight:600}
 main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.5rem;padding-block:2rem 3rem;text-align:center}
@@ -110,7 +110,7 @@ pub fn layout(title: &str, style: &str, main: &str) -> String {
 <main class="frame">
 {main}
 </main>
-<footer><div class="frame"><span class="name"><span class="mark">{small}</span>Almena Mediator</span><span>© {year} Almena ID · <a href="https://almena.id">almena.id</a> · <a href="{DOCS_PATH}">API</a></span></div></footer>
+<footer><div class="frame"><span class="name"><span class="mark">{small}</span>Almena Mediator</span><span>© {year} Almena ID · <a href="https://almena.id">almena.id</a> · <a href="https://github.com/almena-id/mediator">GitHub</a> · <a href="{DOCS_PATH}">API</a></span></div></footer>
 </body></html>
 "#,
         logo = mark(28),
