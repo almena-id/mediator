@@ -61,8 +61,8 @@ fn mark(size: u32) -> String {
 }
 
 /// The typefaces, the colours and the frame every page shares. Colours are
-/// the wallet's dark tokens with its blue accent, the one the icon is drawn
-/// in; green and red carry the status only. Header and footer are the
+/// the wallet's dark tokens with its magenta accent, the one the icon is
+/// drawn in; green and red carry the status only. Header and footer are the
 /// portals': a sticky, blurred bar on top, the page's width up to 1920 px
 /// with gutters that grow with the screen.
 const LAYOUT_CSS: &str = r#"
@@ -71,7 +71,7 @@ const LAYOUT_CSS: &str = r#"
 @font-face{font-family:"Chakra Petch";font-weight:700;font-display:swap;src:url(/fonts/chakra-petch-700.woff2) format("woff2")}
 @font-face{font-family:"Inter";font-weight:100 900;font-display:swap;src:url(/fonts/inter.woff2) format("woff2")}
 @font-face{font-family:"JetBrains Mono";font-weight:100 800;font-display:swap;src:url(/fonts/jetbrains-mono.woff2) format("woff2")}
-:root{color-scheme:dark;--brand:#2f6fed;--bg:#0f1013;--glow:rgba(47,111,237,.22);--surface:rgba(255,255,255,.06);--border:rgba(255,255,255,.09);--hover:rgba(255,255,255,.07);--text:#f4f4f6;--muted:rgba(244,244,246,.62);--ok:#3ddc84;--down:#ff6b5e;--font-brand:"Chakra Petch",system-ui,sans-serif;--font-sans:"Inter",system-ui,sans-serif;--font-mono:"JetBrains Mono",ui-monospace,monospace;--page-width:1920px;--gutter:clamp(16px,3vw,48px)}
+:root{color-scheme:dark;--brand:#d63384;--bg:#0f1013;--glow:rgba(214,51,132,.22);--surface:rgba(255,255,255,.06);--border:rgba(255,255,255,.09);--hover:rgba(255,255,255,.07);--text:#f4f4f6;--muted:rgba(244,244,246,.62);--ok:#3ddc84;--down:#ff6b5e;--font-brand:"Chakra Petch",system-ui,sans-serif;--font-sans:"Inter",system-ui,sans-serif;--font-mono:"JetBrains Mono",ui-monospace,monospace;--page-width:1920px;--gutter:clamp(16px,3vw,48px)}
 html,body{margin:0}
 body{display:flex;flex-direction:column;min-height:100dvh;background:radial-gradient(60rem 40rem at 50% 40%,var(--glow),transparent 70%) fixed,var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.5;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 h1,h2,h3{font-family:var(--font-brand)}
