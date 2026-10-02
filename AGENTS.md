@@ -30,6 +30,8 @@ Cargo workspace:
 
 ## Rules
 
+- Blue `#2f6fed` is the mediator's identity, the wallet's blue accent and the colour `assets/icon.png` is drawn in: `--brand` in `home.rs` (`LAYOUT_CSS`), carried by the mark in the header and footer and the "Open in Almena wallet" button. Green and red carry the status only. The identity colours across Almena: status cyan `#3fe0ff`, catalog blue `#2563eb`, registry green `#1f9d55`, mediator blue `#2f6fed`, landing orange `#eb7229`, docu yellow `#f2b705`, the wallet the person's choice (orange by default).
+
 - Everything is written in English.
 - `almena-didcomm` denies `unwrap`/`expect` outside tests (`clippy.toml` allows them in tests) and uses `thiserror`; the mediator binary uses `anyhow`.
 - Every HTTP endpoint of the public router is declared with `#[utoipa::path]` and registered through `OpenApiRouter` in `crates/mediator/src/routes.rs`, so it appears in `/openapi.json` and `/docs`. Keep the README endpoint table in sync.
