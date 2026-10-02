@@ -45,6 +45,7 @@ Keep `keys.json` (the `mediator-data` volume) private and backed up: it is the m
 | `GET /fonts/{name}` | The typefaces of the mediator's pages (WOFF2), served by the mediator itself |
 | `POST /didcomm`, `GET /ws` | DIDComm over HTTPS and WebSocket |
 | `GET /.well-known/did.json` | The mediator's DID document |
+| `GET /.well-known/security.txt` | Where to report a vulnerability ([RFC 9116](https://www.rfc-editor.org/rfc/rfc9116)): this repository's private advisories; `Expires` stays 180 days ahead |
 | `GET /oob/invitation`, `GET /oob` | Out-of-Band mediation invitation (JSON, and a page for its QR URL) |
 | `GET /health` | Health, `503` while storage is down |
 | `GET /docs`, `GET /openapi.json` | API reference, generated from the code |

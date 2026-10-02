@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -64,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(receive))
         .routes(routes!(websocket))
         .routes(routes!(did_document))
+        .routes(routes!(security_txt))
         .routes(routes!(invitation))
         .routes(routes!(invitation_page))
         .routes(routes!(health))
@@ -479,6 +481,61 @@ async fn did_document(State(state): State<AppState>) -> Json<serde_json::Value> 
     Json(state.mediator.identity().document.to_json())
 }
 
+/// Where vulnerabilities are reported: privately, through the repository's GitHub.
+const REPOSITORY: &str = "https://github.com/almena-network/mediator";
+/// security.txt must expire, in less than a year; written on each request, it
+/// stays this far ahead while the mediator runs.
+const SECURITY_TXT_TTL: Duration = Duration::from_secs(180 * 24 * 60 * 60);
+
+/// security.txt
+///
+/// Where to report a vulnerability (RFC 9116): the repository's private
+/// security advisories.
+#[utoipa::path(
+    get,
+    path = "/.well-known/security.txt",
+    tag = "operations",
+    responses((status = 200, description = "security.txt", content_type = "text/plain"))
+)]
+async fn security_txt() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        security_txt_body(SystemTime::now() + SECURITY_TXT_TTL),
+    )
+}
+
+fn security_txt_body(expires: SystemTime) -> String {
+    format!(
+        "Contact: {REPOSITORY}/security/advisories/new\n\
+         Expires: {}\n\
+         Policy: {REPOSITORY}/security/policy\n\
+         Preferred-Languages: en, es\n",
+        rfc3339(expires)
+    )
+}
+
+/// `time` as an RFC 3339 UTC timestamp to the second, e.g. `2026-10-02T09:30:00Z`.
+fn rfc3339(time: SystemTime) -> String {
+    let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's `civil_from_days`).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Health {
     /// `ok`, or `degraded` when a dependency is down.
@@ -617,6 +674,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn security_txt_is_served_at_the_well_known_path() {
+        let (status, body) = get(state(), "/.well-known/security.txt").await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(
+            "Contact: https://github.com/almena-network/mediator/security/advisories/new\n"
+        ));
+        assert!(text.contains("Expires: "));
+    }
+
+    #[test]
+    fn security_txt_expires_on_the_given_instant() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_806_143_400);
+        assert!(security_txt_body(expires).contains("Expires: 2027-03-27T10:30:00Z\n"));
+        assert_eq!(rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            rfc3339(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
     async fn ping_over_http_with_return_route_is_answered_in_the_body() {
         let state = state();
         let wallet = Wallet::new(Curve::X25519);
@@ -687,7 +766,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["info"]["title"], "Almena mediator");
-        for path in ["/health", "/didcomm", "/.well-known/did.json"] {
+        for path in [
+            "/health",
+            "/didcomm",
+            "/.well-known/did.json",
+            "/.well-known/security.txt",
+        ] {
             assert!(json["paths"][path].is_object(), "{path} missing");
         }
     }

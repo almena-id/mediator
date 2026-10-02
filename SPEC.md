@@ -339,6 +339,7 @@ Live mode: the wallet sends an authcrypted `live-delivery-change` with `live_del
 | Endpoint | Content |
 |---|---|
 | `GET /.well-known/did.json` | The mediator's DID document (§5.2). |
+| `GET /.well-known/security.txt` | Where to report a vulnerability (RFC 9116). |
 | `GET /oob/invitation` | The invitation (§6.5) and its URL form, as JSON. |
 | `GET /oob` | Human-readable invitation page. |
 | `GET /health` | Status, version and DID; `503` while storage is down. |
