@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Json, Router, routing::get};
@@ -60,6 +60,7 @@ pub fn router(state: AppState) -> Router {
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(home_page))
         .routes(routes!(icon))
+        .routes(routes!(font))
         .routes(routes!(receive))
         .routes(routes!(websocket))
         .routes(routes!(did_document))
@@ -76,7 +77,7 @@ pub fn router(state: AppState) -> Router {
 
 /// Home page
 ///
-/// What a browser shows at the mediator's root: its icon and name, and the
+/// What a browser shows at the mediator's root: the
 /// status, version and DID that `/health` also reports, and the mediation
 /// invitation as a QR code for the wallet.
 #[utoipa::path(
@@ -101,7 +102,7 @@ async fn home_page(State(state): State<AppState>) -> Html<String> {
 
 /// Icon
 ///
-/// The mediator's icon, used by the home page and as its favicon.
+/// The mediator's icon, the favicon of its pages.
 #[utoipa::path(
     get,
     path = "/icon.png",
@@ -116,6 +117,34 @@ async fn icon() -> impl IntoResponse {
         ],
         home::ICON,
     )
+}
+
+/// Font
+///
+/// One of the typefaces the mediator's pages use (WOFF2, SIL Open Font
+/// License), served by the mediator itself so a page never calls a third party.
+#[utoipa::path(
+    get,
+    path = "/fonts/{name}",
+    tag = "operations",
+    params(("name" = String, Path, description = "Font file, e.g. `inter.woff2`")),
+    responses(
+        (status = 200, description = "WOFF2 font", content_type = "font/woff2"),
+        (status = 404, description = "No such font")
+    )
+)]
+async fn font(Path(name): Path<String>) -> Response {
+    match home::font(&name) {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "font/woff2"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 fn docs(api: OpenApiDoc) -> Router {
@@ -782,6 +811,11 @@ mod tests {
         let (status, body) = get(state(), home::ICON_PATH).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.starts_with(b"\x89PNG"));
+        let (status, body) = get(state(), "/fonts/inter.woff2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with(b"wOF2"));
+        let (status, _) = get(state(), "/fonts/missing.woff2").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

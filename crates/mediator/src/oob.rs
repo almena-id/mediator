@@ -9,6 +9,7 @@ use almena_didcomm::{Message, b64};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::home::{escape, layout};
 use crate::identity::Identity;
 
 pub const INVITATION: &str = "https://didcomm.org/out-of-band/2.0/invitation";
@@ -58,30 +59,25 @@ fn encode(invitation: &Message) -> String {
 /// The page shown when someone opens the invitation URL in a browser, with a
 /// link that opens the invitation in the wallet (`wallet_url`).
 pub fn page(did: &str, wallet_url: &str) -> String {
-    let escape = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    };
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Almena mediator</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}code{{word-break:break-all}}</style></head>
-<body>
-<h1>Almena mediator</h1>
+    let main = format!(
+        r#"<h1>Mediation invitation</h1>
 <p>This is an invitation to use this mediator on Almena Network.
 Open it in the Almena wallet, or scan its QR code with the wallet.</p>
-<p><a href="{wallet_url}">Open in Almena wallet</a></p>
-<p>Mediator DID: <code>{did}</code></p>
-</body></html>
+<a class="open" href="{wallet_url}">Open in Almena wallet</a>
+<p class="did">Mediator DID: <code>{did}</code></p>
 "#,
         wallet_url = escape(wallet_url),
         did = escape(did),
-    )
+    );
+    layout("Almena Mediator", PAGE_CSS, &main)
 }
+
+/// The invitation page's own styles, on top of the shared layout's.
+const PAGE_CSS: &str = r#"
+h1{margin:0;font-size:clamp(1.5rem,5vw,2rem);font-weight:600;letter-spacing:-.02em}
+p{margin:0;max-width:36rem;color:var(--muted)}
+.did{font-size:.875rem}
+"#;
 
 #[cfg(test)]
 mod tests {
