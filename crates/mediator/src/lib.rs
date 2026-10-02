@@ -1,4 +1,4 @@
-//! Almena Network mediator (DIDComm Messaging v2.0).
+//! Almena ID mediator (DIDComm Messaging v2.0).
 
 pub mod config;
 pub mod dispatch;

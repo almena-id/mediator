@@ -1,6 +1,6 @@
 # almena-mediator
 
-The mediator of Almena Network: a [DIDComm Messaging v2.0](https://identity.foundation/didcomm-messaging/spec/v2.0/) mailbox for wallets. It queues end-to-end encrypted messages until their wallet picks them up (over HTTPS, or live over a WebSocket), relays messages for wallets mediated elsewhere, wakes mobile wallets with content-free push notifications, and gives its wallets credentials for a TURN relay (coturn) for their calls. It never sees message or call content.
+The mediator of Almena ID: a [DIDComm Messaging v2.0](https://identity.foundation/didcomm-messaging/spec/v2.0/) mailbox for wallets. It queues end-to-end encrypted messages until their wallet picks them up (over HTTPS, or live over a WebSocket), relays messages for wallets mediated elsewhere, wakes mobile wallets with content-free push notifications, and gives its wallets credentials for a TURN relay (coturn) for their calls. It never sees message or call content.
 
 It implements Coordinate Mediation 3.0, Routing 2.0, Message Pickup 3.0 (with live mode), Trust Ping, Discover Features, Report Problem and Out-of-Band 2.0, plus its own TURN 1.0 for call relay credentials, on top of `almena-didcomm` (`crates/didcomm`), its own DIDComm library. [SPEC.md](SPEC.md) specifies the Almena Mediator — its profile of DIDComm v2.0 and what it adds — and, in its appendices, the design and every decision behind it.
 
@@ -20,7 +20,7 @@ task health   # {"status":"ok",…}
 task smoke    # end-to-end check: mediation, a forwarded message, pickup
 ```
 
-Every merge into `main` publishes the image `ghcr.io/almena-network/mediator` (amd64 and arm64) with a `year.month.sequence` version (e.g. `2026.09.1`, the sequence restarting each month), also tagged `latest` and `sha-<commit>`; the commit gets the git tag `v<version>`.
+Every merge into `main` publishes the image `ghcr.io/almena-id/mediator` (amd64 and arm64) with a `year.month.sequence` version (e.g. `2026.09.1`, the sequence restarting each month), also tagged `latest` and `sha-<commit>`; the commit gets the git tag `v<version>`.
 
 ## Configuration
 

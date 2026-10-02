@@ -110,7 +110,7 @@ pub fn layout(title: &str, style: &str, main: &str) -> String {
 <main class="frame">
 {main}
 </main>
-<footer><div class="frame"><span class="name"><span class="mark">{small}</span>Almena Mediator</span><span>© {year} Almena Network · <a href="https://almena.id">almena.id</a> · <a href="{DOCS_PATH}">API</a></span></div></footer>
+<footer><div class="frame"><span class="name"><span class="mark">{small}</span>Almena Mediator</span><span>© {year} Almena ID · <a href="https://almena.id">almena.id</a> · <a href="{DOCS_PATH}">API</a></span></div></footer>
 </body></html>
 "#,
         logo = mark(28),

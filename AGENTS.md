@@ -1,6 +1,6 @@
 # almena-mediator — notes for contributors and agents
 
-Server of Almena Network, a decentralised messaging platform based on DIDComm Messaging v2.0
+Server of Almena ID, a decentralised messaging platform based on DIDComm Messaging v2.0
 (https://identity.foundation/didcomm-messaging/spec/v2.0/). DIDs follow W3C DID (https://www.w3.org/TR/did/). Phases 1–6 of SPEC.md (Appendix I) are done: the DIDComm library, the mediator skeleton, mediation, live delivery / invitations / federation, push wake-ups, and TURN credentials for calls.
 
 This project is independent: it has its own Docker Compose file, env file and tooling.

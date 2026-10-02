@@ -1,6 +1,6 @@
 [package]
 name = "almena-mediator"
-description = "Almena Network mediator: the server side of the platform (DIDComm Messaging v2.0)"
+description = "Almena ID mediator: the server side of the platform (DIDComm Messaging v2.0)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -61,7 +61,7 @@ fn encode(invitation: &Message) -> String {
 pub fn page(did: &str, wallet_url: &str) -> String {
     let main = format!(
         r#"<h1>Mediation invitation</h1>
-<p>This is an invitation to use this mediator on Almena Network.
+<p>This is an invitation to use this mediator on Almena ID.
 Open it in the Almena wallet, or scan its QR code with the wallet.</p>
 <a class="open" href="{wallet_url}">Open in Almena wallet</a>
 <p class="did">Mediator DID: <code>{did}</code></p>

@@ -31,7 +31,7 @@ const ENCRYPTED: &str = "application/didcomm-encrypted+json";
 #[openapi(
     info(
         title = "Almena mediator",
-        description = "HTTP endpoints published by an Almena Network mediator (DIDComm Messaging v2.0)."
+        description = "HTTP endpoints published by an Almena ID mediator (DIDComm Messaging v2.0)."
     ),
     tags(
         (name = "didcomm", description = "DIDComm Messaging transport and the mediator's DID"),
@@ -482,7 +482,7 @@ async fn did_document(State(state): State<AppState>) -> Json<serde_json::Value> 
 }
 
 /// Where vulnerabilities are reported: privately, through the repository's GitHub.
-const REPOSITORY: &str = "https://github.com/almena-network/mediator";
+const REPOSITORY: &str = "https://github.com/almena-id/mediator";
 /// security.txt must expire, in less than a year; written on each request, it
 /// stays this far ahead while the mediator runs.
 const SECURITY_TXT_TTL: Duration = Duration::from_secs(180 * 24 * 60 * 60);
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let text = String::from_utf8(body).unwrap();
         assert!(text.contains(
-            "Contact: https://github.com/almena-network/mediator/security/advisories/new\n"
+            "Contact: https://github.com/almena-id/mediator/security/advisories/new\n"
         ));
         assert!(text.contains("Expires: "));
     }

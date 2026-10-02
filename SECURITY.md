@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately through GitHub: on
-[almena-network/mediator](https://github.com/almena-network/mediator), open the
+[almena-id/mediator](https://github.com/almena-id/mediator), open the
 **Security** tab and choose **Report a vulnerability**. Do not open a public
 issue, pull request or discussion about it.
 

@@ -1,6 +1,6 @@
 # Builds the mediator's Docker image for linux/amd64 and linux/arm64 whenever
 # something is merged into main, and publishes it to GitHub Container Registry
-# as ghcr.io/almena-network/mediator.
+# as ghcr.io/almena-id/mediator.
 #
 # Versions are year.month.sequence (e.g. 2026.09.1): the sequence starts at 1
 # each month and goes up by one per publication. It is worked out from the git
@@ -29,7 +29,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/almena-network/mediator
+  IMAGE: ghcr.io/almena-id/mediator
 
 concurrency:
   group: docker-image
