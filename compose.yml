@@ -6,8 +6,13 @@ services:
       context: .
     image: almena-mediator:dev
     restart: unless-stopped
+    # The mediator gives requests in flight 20 s to finish, then stops.
+    stop_grace_period: 30s
     ports:
-      - "${ALMENA_MEDIATOR_PORT:-8080}:8080"
+      # Caddy reaches it over the Compose network; the host port is for local
+      # checks only. Published on every interface, anyone could reach it past
+      # Caddy and write their own X-Forwarded-For.
+      - "${ALMENA_MEDIATOR_BIND:-127.0.0.1}:${ALMENA_MEDIATOR_PORT:-8080}:8080"
     environment:
       ALMENA_PUBLIC_URL: ${ALMENA_PUBLIC_URL:-https://${ALMENA_DOMAIN}}
       ALMENA_REDIS_URL: redis://redis:6379
@@ -100,6 +105,12 @@ services:
     command:
       - -n
       - --log-file=stdout
+      # No telnet admin console.
+      - --no-cli
+      # Credentials are free to any mediated wallet: bound what they relay.
+      # Allocations at once, and bytes per second per allocation.
+      - --total-quota=${ALMENA_TURN_TOTAL_QUOTA:-100}
+      - --max-bps=${ALMENA_TURN_MAX_BPS:-500000}
       # Time-limited credentials from the mediator (TURN REST API).
       - --use-auth-secret
       - --static-auth-secret=${ALMENA_TURN_SECRET:-}
@@ -154,6 +165,12 @@ services:
       - everysec
       - --requirepass
       - ${ALMENA_REDIS_PASSWORD:-}
+      # A ceiling, and nothing evicted at it: writes fail (the mediator
+      # answers 503) rather than queued messages silently disappearing.
+      - --maxmemory
+      - ${ALMENA_REDIS_MAXMEMORY:-1gb}
+      - --maxmemory-policy
+      - noeviction
     environment:
       REDIS_PASSWORD: ${ALMENA_REDIS_PASSWORD:-}
     ports:

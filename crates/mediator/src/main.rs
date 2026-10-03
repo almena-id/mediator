@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         },
         max_recipient_dids: config.max_recipient_dids,
         push_min_interval_secs: config.push.min_interval_secs,
+        push_ring_interval_secs: config.push.ring_interval_secs,
         recipient_proof: config.recipient_proof,
         mediation_ttl_secs: config.mediation_ttl_secs,
     };
@@ -90,6 +91,7 @@ async fn main() -> Result<()> {
     mediator.start_relay_retries();
     mediator.start_cleanup();
     let did = mediator.identity().did.clone();
+    let (stop, mut stopping) = tokio::sync::watch::channel(false);
     let state = AppState {
         mediator: Arc::new(mediator),
         store,
@@ -100,6 +102,8 @@ async fn main() -> Result<()> {
             .as_deref()
             .map(axum::http::HeaderName::try_from)
             .transpose()?,
+        sockets: Arc::default(),
+        stopping: stopping.clone(),
     };
 
     if let Some(addr) = config.metrics_addr {
@@ -108,16 +112,35 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, %did, version = almena_mediator::VERSION, "almena mediator listening");
 
-    axum::serve(
+    let server = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = stop.send(true);
+    });
+    // Requests in flight get SHUTDOWN_GRACE to finish (a relay's first
+    // attempts can take a while); then the process stops anyway, before the
+    // container runtime kills it (compose.yml's stop_grace_period is longer).
+    let deadline = async {
+        let _ = stopping.wait_for(|stopping| *stopping).await;
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+    };
+    tokio::select! {
+        served = std::future::IntoFuture::into_future(server) => served?,
+        () = deadline => tracing::warn!(
+            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            "requests still in flight after the grace period, stopping anyway"
+        ),
+    }
 
     tracing::info!("almena mediator stopped");
     Ok(())
 }
+
+/// How long requests in flight may take to finish once a shutdown starts.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// `almena-mediator healthcheck`: exits 0 if `/health` answers 200. Used by the
 /// container healthcheck, since the runtime image ships no curl.

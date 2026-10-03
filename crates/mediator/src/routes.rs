@@ -1,5 +1,6 @@
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Extension;
@@ -51,6 +52,57 @@ pub struct AppState {
     pub client_ip_header: Option<HeaderName>,
     /// The mediator's public origin (`ALMENA_PUBLIC_URL`).
     pub public_url: String,
+    /// Open WebSockets per client (see [`client_key`]).
+    pub sockets: Arc<Sockets>,
+    /// Turns `true` when the mediator is shutting down: open WebSockets are
+    /// closed (`1001`, going away) so that they do not hold the shutdown up.
+    pub stopping: tokio::sync::watch::Receiver<bool>,
+}
+
+/// WebSockets open at once per client, at most.
+pub const MAX_SOCKETS_PER_CLIENT: usize = 16;
+/// The mediator pings an idle socket this often; a socket that sends nothing,
+/// not even the pong, for [`SOCKET_IDLE`] is closed.
+const SOCKET_PING: Duration = Duration::from_secs(30);
+const SOCKET_IDLE: Duration = Duration::from_secs(90);
+
+/// Open WebSockets by client.
+#[derive(Default)]
+pub struct Sockets(Mutex<HashMap<IpAddr, usize>>);
+
+impl Sockets {
+    /// Counts one more socket for `client`, unless it already has
+    /// [`MAX_SOCKETS_PER_CLIENT`]; the guard counts it out when dropped.
+    fn open(self: &Arc<Self>, client: Option<IpAddr>) -> Option<SocketGuard> {
+        let Some(client) = client else {
+            return Some(SocketGuard(None));
+        };
+        let mut open = self.0.lock().ok()?;
+        let count = open.entry(client).or_default();
+        if *count >= MAX_SOCKETS_PER_CLIENT {
+            return None;
+        }
+        *count += 1;
+        Some(SocketGuard(Some((Arc::clone(self), client))))
+    }
+}
+
+struct SocketGuard(Option<(Arc<Sockets>, IpAddr)>);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let Some((sockets, client)) = &self.0 else {
+            return;
+        };
+        if let Ok(mut open) = sockets.0.lock()
+            && let Some(count) = open.get_mut(client)
+        {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(client);
+            }
+        }
+    }
 }
 
 /// The mediator's HTTP router. Every endpoint is registered through
@@ -274,7 +326,7 @@ async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
     match state
         .store
         .hit(
-            &format!("didcomm:{ip}"),
+            &format!("didcomm:{}", client_key(ip)),
             RATE_WINDOW_SECS,
             almena_didcomm::message::now(),
         )
@@ -286,6 +338,7 @@ async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
         }
         Ok(_) => false,
         Err(err) => {
+            crate::metrics::METRICS.store_error();
             tracing::warn!(error = %format!("{err:#}"), "rate limit check failed");
             false
         }
@@ -323,28 +376,41 @@ async fn websocket(
     if over_limit(&state, ip).await {
         return too_many_requests();
     }
+    let Some(guard) = state.sockets.open(ip.map(client_key)) else {
+        return too_many_requests();
+    };
     let max = state.mediator.limits().max_message_bytes;
     upgrade
         .max_message_size(max)
         .max_frame_size(max)
-        .on_upgrade(move |socket| websocket_session(socket, state, ip))
+        .on_upgrade(move |socket| websocket_session(socket, state, ip, guard))
 }
 
-async fn websocket_session(mut socket: WebSocket, state: AppState, ip: Option<IpAddr>) {
+async fn websocket_session(
+    mut socket: WebSocket,
+    state: AppState,
+    ip: Option<IpAddr>,
+    _guard: SocketGuard,
+) {
     let mediator = Arc::clone(&state.mediator);
+    let mut stopping = state.stopping.clone();
     let (mut session, mut pushes) = mediator.open_session();
+    let mut ping = tokio::time::interval(SOCKET_PING);
+    ping.tick().await;
+    let mut heard = tokio::time::Instant::now();
     loop {
         tokio::select! {
             frame = socket.recv() => {
+                heard = tokio::time::Instant::now();
                 let text = match frame {
-                    Some(Ok(WsMessage::Text(text))) => text.to_string(),
-                    Some(Ok(WsMessage::Binary(bytes))) => match String::from_utf8(bytes.to_vec()) {
-                        Ok(text) => text,
-                        Err(_) => continue,
-                    },
-                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                    Some(Ok(WsMessage::Text(text))) => Some(text.to_string()),
+                    Some(Ok(WsMessage::Binary(bytes))) => String::from_utf8(bytes.to_vec()).ok(),
+                    Some(Ok(WsMessage::Ping(_))) => None,
+                    // The answer to our ping: it only says the peer is there.
+                    Some(Ok(WsMessage::Pong(_))) => continue,
                     Some(Ok(WsMessage::Close(_)) | Err(_)) | None => break,
                 };
+                // Every frame the peer sends counts, whether it opens or not.
                 if over_limit(&state, ip).await {
                     // 1008: policy violation.
                     let _ = socket
@@ -355,6 +421,7 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, ip: Option<Ip
                         .await;
                     break;
                 }
+                let Some(text) = text else { continue };
                 match mediator.receive(&text, Some(&mut session)).await {
                     Ok(Outcome::Reply(reply)) => {
                         if socket.send(WsMessage::Text(reply.into())).await.is_err() {
@@ -363,6 +430,27 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, ip: Option<Ip
                     }
                     Ok(Outcome::Accepted) => {}
                     Err(err) => tracing::debug!(error = %err, "websocket message rejected"),
+                }
+            }
+            // A closed channel (no sender) disables this branch.
+            Ok(()) = stopping.changed() => {
+                if *stopping.borrow() {
+                    let _ = socket
+                        .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1001,
+                            reason: "shutting down".into(),
+                        })))
+                        .await;
+                    break;
+                }
+            }
+            _ = ping.tick() => {
+                if heard.elapsed() >= SOCKET_IDLE {
+                    tracing::debug!("websocket idle, closed");
+                    break;
+                }
+                if socket.send(WsMessage::Ping(Bytes::new())).await.is_err() {
+                    break;
                 }
             }
             Some(queued) = pushes.recv() => {
@@ -425,7 +513,8 @@ async fn invitation_page(State(state): State<AppState>) -> Html<String> {
 }
 
 /// The client IP: the last address in the configured proxy header (the one
-/// our proxy added), else the TCP peer.
+/// our proxy added), else the TCP peer — also when the header is configured
+/// but missing, so leaving it out does not escape the rate limit.
 fn client_ip(
     headers: &HeaderMap,
     header: Option<&HeaderName>,
@@ -438,8 +527,25 @@ fn client_ip(
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(','))
             .filter_map(|v| v.trim().parse().ok())
-            .next_back(),
+            .next_back()
+            .or_else(|| peer.map(|p| p.ip())),
         None => peer.map(|p| p.ip()),
+    }
+}
+
+/// Who the rate limit and the socket cap count as one client: an IPv4
+/// address, or an IPv6 /64 — what a single host is usually given, so it
+/// cannot step through its own addresses.
+fn client_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let [a, b, c, d, ..] = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
     }
 }
 
@@ -612,6 +718,8 @@ mod tests {
             rate_limit: 0,
             client_ip_header: None,
             public_url: "https://mediator.example.com".into(),
+            sockets: Arc::default(),
+            stopping: tokio::sync::watch::channel(false).1,
         }
     }
 
@@ -678,9 +786,11 @@ mod tests {
         let (status, body) = get(state(), "/.well-known/security.txt").await;
         assert_eq!(status, StatusCode::OK);
         let text = String::from_utf8(body).unwrap();
-        assert!(text.contains(
-            "Contact: https://github.com/almena-id/mediator/security/advisories/new\n"
-        ));
+        assert!(
+            text.contains(
+                "Contact: https://github.com/almena-id/mediator/security/advisories/new\n"
+            )
+        );
         assert!(text.contains("Expires: "));
     }
 
@@ -837,7 +947,34 @@ mod tests {
             client_ip(&headers, None, peer),
             Some("127.0.0.1".parse().unwrap())
         );
-        assert_eq!(client_ip(&HeaderMap::new(), Some(&name), peer), None);
+        // A request without the header (one that did not come through the
+        // proxy) is counted by its peer, not let through.
+        assert_eq!(
+            client_ip(&HeaderMap::new(), Some(&name), peer),
+            Some("127.0.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_ipv6_client_is_its_64() {
+        let key = |ip: &str| client_key(ip.parse().unwrap());
+        assert_eq!(key("2001:db8:1:2:3:4:5:6"), key("2001:db8:1:2:ffff::1"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:192.0.2.7"), key("192.0.2.7"));
+    }
+
+    #[test]
+    fn sockets_are_capped_per_client() {
+        let sockets = Arc::new(Sockets::default());
+        let client = Some("192.0.2.7".parse().unwrap());
+        let open: Vec<_> = (0..MAX_SOCKETS_PER_CLIENT)
+            .map(|_| sockets.open(client).unwrap())
+            .collect();
+        assert!(sockets.open(client).is_none());
+        assert!(sockets.open(Some("192.0.2.8".parse().unwrap())).is_some());
+        drop(open);
+        assert!(sockets.open(client).is_some());
+        assert!(sockets.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -911,6 +1048,44 @@ mod tests {
                 .unwrap()
                 .contains("did:web:mediator.example.com")
         );
+    }
+
+    /// Shutting down closes the open sockets (1001) instead of waiting for
+    /// them, and counts them out of the per-client cap.
+    #[tokio::test]
+    async fn websockets_close_when_the_mediator_stops() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as Frame;
+
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let state = AppState {
+            stopping,
+            ..state()
+        };
+        let sockets = Arc::clone(&state.sockets);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        stop.send(true).unwrap();
+        let closed = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .unwrap()
+            {
+                Some(Ok(Frame::Close(frame))) => break frame,
+                Some(Ok(_)) => continue,
+                other => panic!("no close frame: {other:?}"),
+            }
+        };
+        assert_eq!(u16::from(closed.unwrap().code), 1001);
+        drop(ws);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(sockets.0.lock().unwrap().is_empty());
     }
 
     /// A real server, a real WebSocket client: live mode pushes a message the

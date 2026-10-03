@@ -9,7 +9,7 @@ use almena_didcomm::did::key::did_key;
 use almena_didcomm::did::peer::{Purpose, peer2};
 use almena_didcomm::{
     ContentEncryption, Curve, DidResolver, Error, FromPrior, InMemorySecrets, LocalResolver,
-    Message, PackOptions, SecretKey, unpack,
+    Message, PackOptions, SecretKey, URGENCY, Urgency, route_with, unpack,
 };
 use serde_json::json;
 
@@ -516,6 +516,103 @@ async fn routing_keys_are_wrapped_last_to_first() {
     let (next, payload) = open_forward(&inner, &payload, &resolver).await;
     assert_eq!(next, bob.did);
     unpack(&payload, &resolver, &bob.secrets).await.unwrap();
+}
+
+/// The urgency of each `forward` layer from the outside in, opened by
+/// `hops` in turn, and the payload under the last one.
+async fn urgencies(
+    hops: &[&Party],
+    mut packed: String,
+    resolver: &LocalResolver,
+) -> (Vec<Option<serde_json::Value>>, String) {
+    let mut found = Vec::new();
+    for hop in hops {
+        let (forward, _) = unpack(&packed, resolver, &hop.secrets).await.unwrap();
+        found.push(forward.extra_headers.get(URGENCY).cloned());
+        packed = forward.attachments.unwrap()[0]
+            .data
+            .json
+            .clone()
+            .unwrap()
+            .to_string();
+    }
+    (found, packed)
+}
+
+#[tokio::test]
+async fn every_forward_of_a_call_carries_its_urgency() {
+    let resolver = LocalResolver::new();
+    let outer = Party::new(Curve::X25519);
+    let inner = Party::new(Curve::X25519);
+    let bob = Party::with_services(
+        Curve::X25519,
+        &[didcomm_service(
+            "https://outer.example/didcomm",
+            &[&outer.did, &inner.did],
+        )],
+    );
+    let alice = Party::new(Curve::X25519);
+
+    let options = PackOptions {
+        urgency: Urgency::Call,
+        ..PackOptions::default()
+    };
+    let packed = ping(&alice, &bob)
+        .pack_encrypted(
+            &bob.did,
+            Some(&alice.did),
+            None,
+            &resolver,
+            &alice.secrets,
+            options,
+        )
+        .await
+        .unwrap();
+    let (found, payload) = urgencies(&[&outer, &inner], packed.message, &resolver).await;
+    assert_eq!(found, [Some(json!("call")), Some(json!("call"))]);
+    // The message itself says nothing about it.
+    let (message, _) = unpack(&payload, &resolver, &bob.secrets).await.unwrap();
+    assert!(!message.extra_headers.contains_key(URGENCY));
+
+    // A mediator relaying the payload keeps it the same way.
+    let relayed = route_with(
+        payload,
+        &bob.did,
+        &resolver,
+        ContentEncryption::A256CbcHs512,
+        Urgency::Call,
+    )
+    .await
+    .unwrap();
+    let (found, _) = urgencies(&[&outer, &inner], relayed.message, &resolver).await;
+    assert_eq!(found, [Some(json!("call")), Some(json!("call"))]);
+}
+
+#[tokio::test]
+async fn ordinary_forwards_carry_no_urgency() {
+    let resolver = LocalResolver::new();
+    let mediator = Party::with_services(
+        Curve::X25519,
+        &[didcomm_service("https://mediator.example/didcomm", &[])],
+    );
+    let bob = Party::with_services(Curve::X25519, &[didcomm_service(&mediator.did, &[])]);
+    let alice = Party::new(Curve::X25519);
+    let packed = ping(&alice, &bob)
+        .pack_encrypted(
+            &bob.did,
+            Some(&alice.did),
+            None,
+            &resolver,
+            &alice.secrets,
+            PackOptions::default(),
+        )
+        .await
+        .unwrap();
+    let (forward, _) = unpack(&packed.message, &resolver, &mediator.secrets)
+        .await
+        .unwrap();
+    assert!(!forward.extra_headers.contains_key(URGENCY));
+    assert_eq!(Urgency::of(&forward), Urgency::Normal);
 }
 
 #[tokio::test]

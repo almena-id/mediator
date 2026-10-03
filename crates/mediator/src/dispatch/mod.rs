@@ -60,6 +60,8 @@ pub struct Limits {
     pub max_recipient_dids: usize,
     /// Least time between two pushes to one mediation.
     pub push_min_interval_secs: u64,
+    /// Least time between two call rings to one mediation.
+    pub push_ring_interval_secs: u64,
     /// Registering a recipient DID other than the mediation's own needs a
     /// possession proof signed by that DID (SPEC.md §6.2).
     pub recipient_proof: bool,
@@ -235,9 +237,36 @@ impl Mediator {
         // A sent push stops further ones until the wallet picks up, but
         // never for longer than messages can wait.
         let hold = self.limits.queue.ttl_secs;
+        let retry = self.limits.push_min_interval_secs;
         tokio::spawn(async move {
-            if let Err(err) = push::wake(store.as_ref(), pusher.as_ref(), &mediation, hold).await {
+            if let Err(err) =
+                push::wake(store.as_ref(), pusher.as_ref(), &mediation, hold, retry).await
+            {
                 tracing::warn!(%mediation, error = %format!("{err:#}"), "push wake-up failed");
+            }
+        });
+    }
+
+    /// A call offer was queued for `mediation`: rings its devices in the
+    /// background, unless a live session will deliver it anyway.
+    pub(crate) fn ring(&self, mediation: &str) {
+        let Some(pusher) = &self.pusher else {
+            return;
+        };
+        if self.live.is_live(mediation) {
+            return;
+        }
+        let (store, pusher, mediation) = (
+            Arc::clone(&self.store),
+            Arc::clone(pusher),
+            mediation.to_owned(),
+        );
+        let interval = self.limits.push_ring_interval_secs;
+        tokio::spawn(async move {
+            if let Err(err) =
+                push::ring(store.as_ref(), pusher.as_ref(), &mediation, interval).await
+            {
+                tracing::warn!(%mediation, error = %format!("{err:#}"), "call push failed");
             }
         });
     }
@@ -257,13 +286,13 @@ impl Mediator {
     /// connection task reads live pushes from the receiver and passes each to
     /// [`Mediator::live_delivery`].
     pub fn open_session(&self) -> (Session, mpsc::Receiver<Queued>) {
-        METRICS.live_session_opened();
+        METRICS.websocket_opened();
         self.live.open()
     }
 
     /// Ends a session: no more live pushes for it.
     pub fn close_session(&self, session: &mut Session) {
-        METRICS.live_session_closed();
+        METRICS.websocket_closed();
         self.live.disable(session);
     }
 
@@ -290,7 +319,12 @@ impl Mediator {
         } else {
             Via::Http
         };
+        let started = std::time::Instant::now();
         let result = self.handle(packed, session).await;
+        METRICS.message_took(started.elapsed());
+        if let Err(ReceiveError::Store(_)) = &result {
+            METRICS.store_error();
+        }
         METRICS.message(
             transport,
             match &result {
@@ -363,8 +397,12 @@ impl Mediator {
                     || t.starts_with(protocols::PUSH_APNS)
                     || t.starts_with(protocols::TURN) =>
                 {
-                    // The wallet is alive: its mediation is not idle.
-                    if let Some(requester) = requester {
+                    // The wallet is alive: its mediation is not idle. Asking
+                    // for TURN credentials alone does not count (SPEC.md §11):
+                    // a mediation kept only for them holds nothing.
+                    if let Some(requester) = requester
+                        && !t.starts_with(protocols::TURN)
+                    {
                         self.store.touch_mediation(requester, now()).await?;
                     }
                     match requester {
@@ -429,6 +467,13 @@ impl Mediator {
                 .await
                 .map_or(Outcome::Accepted, |packed| Outcome::Reply(packed.message));
         }
+        // Pickup answers describe the queue: put into it, each status
+        // request would add to what it reports. They only travel back on the
+        // connection.
+        if request.type_.starts_with(protocols::PICKUP) {
+            tracing::debug!(id = %request.id, "pickup without return route, reply dropped");
+            return Outcome::Accepted;
+        }
         // Only to a sender the authcrypt proved: an unauthenticated `from`
         // could name anyone, and we would be sending them our replies.
         if authenticated {
@@ -440,12 +485,22 @@ impl Mediator {
     }
 
     /// Delivers a reply that cannot go back on the connection, as the spec
-    /// asks: into the sender's queue when it is mediated here, else to its
-    /// `DIDCommMessaging` service (through its mediators) in the background,
-    /// with the relay retries. Without a service the reply is dropped.
+    /// asks: into the sender's queue when it is mediated here — a recipient
+    /// DID of a mediation, or a mediation DID itself, registered or not —
+    /// never wrapped; else to its `DIDCommMessaging` service (through its
+    /// mediators) in the background, with the relay retries. Without a
+    /// service the reply is dropped.
     async fn send_reply(&self, reply: Message, sender: &str) {
         let sender = almena_didcomm::did::did_of(sender);
-        match self.store.mediation_of(sender).await {
+        let mediation = match self.store.mediation_of(sender).await {
+            Ok(None) => match self.store.has_mediation(sender).await {
+                Ok(true) => Ok(Some(sender.to_owned())),
+                Ok(false) => Ok(None),
+                Err(err) => Err(err),
+            },
+            other => other,
+        };
+        match mediation {
             Ok(Some(mediation)) => {
                 let Some(packed) = self.pack_reply(reply, sender, false).await else {
                     return;
@@ -705,6 +760,17 @@ mod tests {
         bob: &Wallet,
         text: &str,
     ) -> Result<Outcome, ReceiveError> {
+        send_via_mediator_with(mediator, alice, bob, text, almena_didcomm::Urgency::Normal).await
+    }
+
+    /// [`send_via_mediator`], with the forward marked `urgency`.
+    async fn send_via_mediator_with(
+        mediator: &Mediator,
+        alice: &Wallet,
+        bob: &Wallet,
+        text: &str,
+        urgency: almena_didcomm::Urgency,
+    ) -> Result<Outcome, ReceiveError> {
         let packed = Message::new(
             "https://example.com/chat/1.0/message",
             json!({ "text": text }),
@@ -717,7 +783,10 @@ mod tests {
             None,
             &Wallet::resolver(mediator.identity()),
             &alice.secrets,
-            PackOptions::default(),
+            PackOptions {
+                urgency,
+                ..PackOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -1022,6 +1091,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mediation_did_gets_its_replies_unregistered_and_unwrapped() {
+        let mediator = mediator();
+        // Mediated here, its DID not registered as a recipient, and naming
+        // the mediator as its own: a reply wrapped for its service would
+        // come back here and be dropped.
+        let bob = Wallet::mediated_by(&mediator.identity().did);
+        bob.request(&mediator, protocols::MEDIATE_REQUEST, json!({}))
+            .await;
+        ping_without_return_route(&mediator, &bob, false).await;
+
+        let delivery = bob
+            .request(&mediator, protocols::DELIVERY_REQUEST, json!({"limit": 10}))
+            .await;
+        let attachments = delivery.attachments.unwrap();
+        assert_eq!(attachments.len(), 1);
+        let queued =
+            String::from_utf8(b64::decode(attachments[0].data.base64.as_deref().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            bob.open(mediator.identity(), &queued).await.type_,
+            protocols::PING_RESPONSE
+        );
+    }
+
+    #[tokio::test]
+    async fn pickup_answers_only_travel_back_on_the_connection() {
+        let mediator = mediator();
+        let bob = Wallet::mediated_by(&mediator.identity().did);
+        mediate(&mediator, &bob).await;
+        let status = Message::new(protocols::STATUS_REQUEST, json!({})).from(&bob.did);
+        let packed = bob.send(mediator.identity(), status, false).await;
+        assert_eq!(
+            mediator.receive(&packed, None).await.unwrap(),
+            Outcome::Accepted
+        );
+        let status = bob
+            .request(&mediator, protocols::STATUS_REQUEST, json!({}))
+            .await;
+        assert_eq!(status.body["message_count"], 0);
+    }
+
+    #[tokio::test]
     async fn an_unauthenticated_sender_gets_no_reply_anywhere() {
         let mediator = mediator();
         let bob = Wallet::mediated_by(&mediator.identity().did);
@@ -1054,6 +1165,20 @@ mod tests {
             response.body["updated"].as_array().unwrap().last().unwrap()["result"],
             "client_error"
         );
+
+        // More updates than a mediation may hold DIDs: refused whole, before
+        // any proof is looked at.
+        let updates: Vec<_> = (0..=crate::testing::LIMITS.max_recipient_dids)
+            .map(|i| json!({"recipient_did": format!("did:example:x{i}"), "action": "add"}))
+            .collect();
+        let report = bob
+            .request(
+                &mediator,
+                protocols::RECIPIENT_UPDATE,
+                json!({ "updates": updates }),
+            )
+            .await;
+        assert_eq!(report.body["code"], "e.m.msg.invalid-body");
     }
 
     #[tokio::test]
@@ -1308,6 +1433,10 @@ mod tests {
             self.net.get_json(url).await
         }
 
+        async fn get_text(&self, url: &str) -> anyhow::Result<String> {
+            self.net.get_text(url).await
+        }
+
         async fn post_didcomm(&self, url: &str, message: &str) -> anyhow::Result<()> {
             use std::sync::atomic::Ordering;
             if self
@@ -1461,26 +1590,30 @@ mod tests {
     // ---- Push wake-ups ----
 
     use crate::push::Service;
-    use crate::testing::RecordingPusher;
+    use crate::testing::{Pushed, RecordingPusher};
+    use almena_didcomm::Urgency;
     use tokio::sync::mpsc::UnboundedReceiver;
+
+    type Sent = UnboundedReceiver<(Pushed, Service, String)>;
 
     const FCM_SET: &str = "https://didcomm.org/push-notifications-fcm/1.0/set-device-info";
     const FCM_GET: &str = "https://didcomm.org/push-notifications-fcm/1.0/get-device-info";
     const APNS_SET: &str = "https://didcomm.org/push-notifications-apns/1.0/set-device-info";
+    const APNS_GET: &str = "https://didcomm.org/push-notifications-apns/1.0/get-device-info";
 
-    fn mediator_with_push() -> (Mediator, UnboundedReceiver<(Service, String)>) {
+    fn mediator_with_push() -> (Mediator, Sent) {
         let (pusher, sent) = RecordingPusher::new(&[Service::Fcm, Service::Apns]);
         (mediator().with_pusher(pusher), sent)
     }
 
-    async fn next_push(sent: &mut UnboundedReceiver<(Service, String)>) -> (Service, String) {
+    async fn next_push(sent: &mut Sent) -> (Pushed, Service, String) {
         tokio::time::timeout(std::time::Duration::from_secs(2), sent.recv())
             .await
             .expect("a push")
             .unwrap()
     }
 
-    async fn no_push(sent: &mut UnboundedReceiver<(Service, String)>) {
+    async fn no_push(sent: &mut Sent) {
         let waited = tokio::time::timeout(std::time::Duration::from_millis(200), sent.recv()).await;
         assert!(waited.is_err(), "unexpected push: {waited:?}");
     }
@@ -1557,7 +1690,10 @@ mod tests {
         send_via_mediator(&mediator, &alice, &bob, "one")
             .await
             .unwrap();
-        assert_eq!(next_push(&mut sent).await, (Service::Apns, "a1b2".into()));
+        assert_eq!(
+            next_push(&mut sent).await,
+            (Pushed::Wake, Service::Apns, "a1b2".into())
+        );
         send_via_mediator(&mediator, &alice, &bob, "two")
             .await
             .unwrap();
@@ -1569,7 +1705,10 @@ mod tests {
         send_via_mediator(&mediator, &alice, &bob, "three")
             .await
             .unwrap();
-        assert_eq!(next_push(&mut sent).await, (Service::Apns, "a1b2".into()));
+        assert_eq!(
+            next_push(&mut sent).await,
+            (Pushed::Wake, Service::Apns, "a1b2".into())
+        );
     }
 
     #[tokio::test]
@@ -1593,7 +1732,208 @@ mod tests {
         send_via_mediator(&mediator, &alice, &bob, "hi")
             .await
             .unwrap();
+        // Nor a ring: the call offer reaches the wallet live.
+        send_via_mediator_with(&mediator, &alice, &bob, "call", Urgency::Call)
+            .await
+            .unwrap();
         no_push(&mut sent).await;
+    }
+
+    #[tokio::test]
+    async fn a_call_rings_and_a_message_wakes() {
+        let (mediator, mut sent) = mediator_with_push();
+        let bob = Wallet::mediated_by(&mediator.identity().did);
+        let alice = Wallet::new(Curve::X25519);
+        mediate(&mediator, &bob).await;
+        bob.request(
+            &mediator,
+            FCM_SET,
+            json!({"device_token": "phone", "device_platform": "android"}),
+        )
+        .await;
+
+        send_via_mediator(&mediator, &alice, &bob, "hi")
+            .await
+            .unwrap();
+        assert_eq!(
+            next_push(&mut sent).await,
+            (Pushed::Wake, Service::Fcm, "phone".into())
+        );
+        // The wake-up hold does not keep a call from ringing.
+        send_via_mediator_with(&mediator, &alice, &bob, "call", Urgency::Call)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_push(&mut sent).await,
+            (Pushed::Ring, Service::Fcm, "phone".into())
+        );
+        no_push(&mut sent).await;
+    }
+
+    #[tokio::test]
+    async fn calls_ring_once_per_ring_interval() {
+        let (pusher, mut sent) = RecordingPusher::new(&[Service::Fcm]);
+        let mediator = Mediator::new(
+            Identity::ephemeral("https://mediator.example.com").unwrap(),
+            Arc::new(crate::store::MemoryStore::new()),
+            Limits {
+                push_ring_interval_secs: 3600,
+                ..crate::testing::LIMITS
+            },
+            None,
+        )
+        .with_pusher(pusher);
+        let bob = Wallet::mediated_by(&mediator.identity().did);
+        let alice = Wallet::new(Curve::X25519);
+        mediate(&mediator, &bob).await;
+        bob.request(
+            &mediator,
+            FCM_SET,
+            json!({"device_token": "phone", "device_platform": "android"}),
+        )
+        .await;
+
+        send_via_mediator_with(&mediator, &alice, &bob, "offer", Urgency::Call)
+            .await
+            .unwrap();
+        assert_eq!(next_push(&mut sent).await.0, Pushed::Ring);
+        // The caller sends its offer again: the phone is already ringing.
+        send_via_mediator_with(&mediator, &alice, &bob, "offer again", Urgency::Call)
+            .await
+            .unwrap();
+        no_push(&mut sent).await;
+    }
+
+    #[tokio::test]
+    async fn an_iphone_registers_its_voip_token_with_the_apns_protocol() {
+        let (mediator, mut sent) = mediator_with_push();
+        let bob = Wallet::mediated_by(&mediator.identity().did);
+        let alice = Wallet::new(Curve::X25519);
+        mediate(&mediator, &bob).await;
+        let info = || bob.request(&mediator, APNS_GET, json!({}));
+
+        bob.request(
+            &mediator,
+            APNS_SET,
+            json!({"device_token": "a1b2", "voip_device_token": "c3d4"}),
+        )
+        .await;
+        let body = info().await.body;
+        assert_eq!(body["device_token"], "a1b2");
+        assert_eq!(body["voip_device_token"], "c3d4");
+
+        // A call rings the VoIP token alone; a message wakes the alert one.
+        send_via_mediator_with(&mediator, &alice, &bob, "call", Urgency::Call)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_push(&mut sent).await,
+            (Pushed::Ring, Service::ApnsVoip, "c3d4".into())
+        );
+        send_via_mediator(&mediator, &alice, &bob, "hi")
+            .await
+            .unwrap();
+        assert_eq!(
+            next_push(&mut sent).await,
+            (Pushed::Wake, Service::Apns, "a1b2".into())
+        );
+        no_push(&mut sent).await;
+
+        // Replaced.
+        bob.request(
+            &mediator,
+            APNS_SET,
+            json!({"device_token": "a1b2", "voip_device_token": "e5f6"}),
+        )
+        .await;
+        assert_eq!(info().await.body["voip_device_token"], "e5f6");
+        // A registration without it says the device has none.
+        bob.request(&mediator, APNS_SET, json!({"device_token": "a1b2"}))
+            .await;
+        let body = info().await.body;
+        assert_eq!(body["device_token"], "a1b2");
+        assert!(body["voip_device_token"].is_null());
+        // All null removes both.
+        bob.request(
+            &mediator,
+            APNS_SET,
+            json!({"device_token": null, "voip_device_token": "e5f6"}),
+        )
+        .await;
+        bob.request(
+            &mediator,
+            APNS_SET,
+            json!({"device_token": null, "voip_device_token": null}),
+        )
+        .await;
+        assert!(mediator.store().devices(&bob.did).await.unwrap().is_empty());
+        let bad = bob
+            .request(
+                &mediator,
+                APNS_SET,
+                json!({"device_token": "a1b2", "voip_device_token": "not hex"}),
+            )
+            .await;
+        assert_eq!(bad.body["code"], "e.m.msg.invalid-body");
+    }
+
+    /// Alice hands her call offer for Bob, mediated at B, to her own mediator
+    /// A: the forward A wraps for B still says it is a call.
+    #[tokio::test]
+    async fn a_relayed_call_still_rings() {
+        let net = Arc::new(InProcess::default());
+        let (pusher, mut sent) = RecordingPusher::new(&[Service::Fcm]);
+        let a = mediator_at(
+            "https://a.example",
+            Some(net.clone() as Arc<dyn crate::transport::Transport>),
+        );
+        let b = Arc::new(
+            Mediator::new(
+                Identity::ephemeral("https://b.example").unwrap(),
+                Arc::new(crate::store::MemoryStore::new()),
+                crate::testing::LIMITS,
+                Some(net.clone() as Arc<dyn crate::transport::Transport>),
+            )
+            .with_pusher(pusher),
+        );
+        net.add("https://a.example", &a);
+        net.add("https://b.example", &b);
+        let bob = Wallet::mediated_by(&b.identity().did);
+        mediate(&b, &bob).await;
+        bob.request(
+            &b,
+            FCM_SET,
+            json!({"device_token": "phone", "device_platform": "android"}),
+        )
+        .await;
+
+        let alice = Wallet::new(Curve::X25519);
+        let offer = Message::new("https://example.com/call/1.0/offer", json!({}))
+            .from(&alice.did)
+            .to([bob.did.as_str()])
+            .pack_encrypted(
+                &bob.did,
+                Some(&alice.did),
+                None,
+                &Local::new(),
+                &alice.secrets,
+                PackOptions {
+                    forward: false,
+                    ..PackOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&offer.message).unwrap();
+        let forward = Message::new(FORWARD, json!({"next": bob.did}))
+            .header(almena_didcomm::URGENCY, json!("call"))
+            .attachment(Attachment::json(envelope));
+        let packed = alice.send(a.identity(), forward, true).await;
+        assert_eq!(a.receive(&packed, None).await.unwrap(), Outcome::Accepted);
+        assert_eq!(
+            next_push(&mut sent).await,
+            (Pushed::Ring, Service::Fcm, "phone".into())
+        );
     }
 
     #[tokio::test]
@@ -1612,7 +1952,7 @@ mod tests {
         send_via_mediator(&mediator, &alice, &bob, "hi")
             .await
             .unwrap();
-        assert_eq!(next_push(&mut sent).await.1, "dead-token");
+        assert_eq!(next_push(&mut sent).await.2, "dead-token");
         for _ in 0..50 {
             if mediator.store().devices(&bob.did).await.unwrap().is_empty() {
                 return;

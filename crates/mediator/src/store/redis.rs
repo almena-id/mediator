@@ -12,10 +12,13 @@
 //! | `mediation:{M}:msg:{id}` | string | Body of queue entry `id`, expiring with the queue TTL |
 //! | `mediation:{M}:bytes` | string | Total size of the queued messages, for `max_bytes` |
 //! | `rate:{key}:{window}` | string | Hit counter of one rate-limit window |
-//! | `push:{M}` | hash | Push service (`fcm`, `apns`) → device, as JSON |
+//! | `push:{M}` | hash | Push service (`fcm`, `apns`, `apns-voip`) → device, as JSON |
 //! | `push-sent:{M}` | string | Time of the last push, until the wallet picks up |
+//! | `ring:{M}` | string | Time of the last call ring, for the ring interval |
 //! | `relay:due` | sorted set | Relay ids by when they are next tried |
 //! | `relay:items` | hash | Relay id → the pending relay, as JSON |
+//! | `relay:hosts` | hash | Destination host → relays waiting for it |
+//! | `relay:bytes` | string | Total size of the relays waiting |
 //!
 //! Bodies live outside the stream so that status queries read only the small
 //! entries. Multi-key updates run as Lua scripts, so they are atomic; every
@@ -31,8 +34,8 @@ use redis::aio::ConnectionManager;
 use redis::streams::StreamRangeReply;
 
 use super::{
-    AddRecipient, PendingRelay, QueueLimits, QueueSummary, Queued, RemoveRecipient, Store,
-    id_millis, is_queue_id,
+    AddRecipient, PendingRelay, QueueLimits, QueueSummary, Queued, RelayLimits, RemoveRecipient,
+    Store, id_millis, is_queue_id,
 };
 use crate::push::{Device, Service};
 
@@ -81,20 +84,27 @@ end
 ";
 
 /// KEYS[1] queue, KEYS[2] byte counter; ARGV: min id, max messages, max
-/// bytes, recipient, size, body, ttl, body key prefix.
+/// bytes, recipient, ttl, body key prefix, then the bodies. All or none.
 static ENQUEUE: LazyLock<String> = LazyLock::new(|| {
     format!(
         r"{QUEUE_LUA}
 trim(KEYS[1], KEYS[2], ARGV[1])
-if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[2]) then return false end
+local first = 7
+if redis.call('XLEN', KEYS[1]) + #ARGV - first + 1 > tonumber(ARGV[2]) then return false end
+local adding = 0
+for i = first, #ARGV do adding = adding + #ARGV[i] end
 local used = tonumber(redis.call('GET', KEYS[2]) or '0')
-if used + tonumber(ARGV[5]) > tonumber(ARGV[3]) then return false end
-local id = redis.call('XADD', KEYS[1], '*', 'r', ARGV[4], 's', ARGV[5])
-redis.call('SET', ARGV[8] .. id, ARGV[6], 'EX', ARGV[7])
-redis.call('INCRBY', KEYS[2], ARGV[5])
-redis.call('EXPIRE', KEYS[1], ARGV[7])
-redis.call('EXPIRE', KEYS[2], ARGV[7])
-return id
+if used + adding > tonumber(ARGV[3]) then return false end
+local ids = {{}}
+for i = first, #ARGV do
+  local id = redis.call('XADD', KEYS[1], '*', 'r', ARGV[4], 's', #ARGV[i])
+  redis.call('SET', ARGV[6] .. id, ARGV[i], 'EX', ARGV[5])
+  table.insert(ids, id)
+end
+redis.call('INCRBY', KEYS[2], adding)
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+redis.call('EXPIRE', KEYS[2], ARGV[5])
+return ids
 "
     )
 });
@@ -176,15 +186,41 @@ return 1
 
 const RELAY_DUE: &str = "relay:due";
 const RELAY_ITEMS: &str = "relay:items";
+const RELAY_HOSTS: &str = "relay:hosts";
+const RELAY_BYTES: &str = "relay:bytes";
 
-/// KEYS[1] due set, KEYS[2] items; ARGV: id, due, relay JSON, max pending.
+/// KEYS[1] due set, KEYS[2] items, KEYS[3] hosts, KEYS[4] bytes; ARGV: id,
+/// due, relay JSON, destination, size, max pending, max per destination,
+/// max bytes. A new relay is counted in for its destination and its size.
 const SCHEDULE_RELAY: &str = r"
-if redis.call('HEXISTS', KEYS[2], ARGV[1]) == 0
-   and redis.call('HLEN', KEYS[2]) >= tonumber(ARGV[4]) then
-  return 0
+if redis.call('HEXISTS', KEYS[2], ARGV[1]) == 0 then
+  local to_it = tonumber(redis.call('HGET', KEYS[3], ARGV[4]) or '0')
+  local bytes = tonumber(redis.call('GET', KEYS[4]) or '0')
+  if redis.call('HLEN', KEYS[2]) >= tonumber(ARGV[6])
+     or to_it >= tonumber(ARGV[7])
+     or bytes + tonumber(ARGV[5]) > tonumber(ARGV[8]) then
+    return 0
+  end
+  redis.call('HINCRBY', KEYS[3], ARGV[4], 1)
+  redis.call('INCRBY', KEYS[4], ARGV[5])
 end
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[3])
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+return 1
+";
+
+/// KEYS as for SCHEDULE_RELAY; ARGV: id, destination, size. Counts the relay
+/// out only if it was still there, so finishing it twice is harmless.
+const FINISH_RELAY: &str = r"
+redis.call('ZREM', KEYS[1], ARGV[1])
+if redis.call('HDEL', KEYS[2], ARGV[1]) == 1 then
+  if redis.call('HINCRBY', KEYS[3], ARGV[2], -1) <= 0 then
+    redis.call('HDEL', KEYS[3], ARGV[2])
+  end
+  if redis.call('DECRBY', KEYS[4], ARGV[3]) <= 0 then
+    redis.call('DEL', KEYS[4])
+  end
+end
 return 1
 ";
 
@@ -297,6 +333,10 @@ fn devices_key(mediation: &str) -> String {
 
 fn push_sent_key(mediation: &str) -> String {
     format!("push-sent:{mediation}")
+}
+
+fn ring_key(mediation: &str) -> String {
+    format!("ring:{mediation}")
 }
 
 /// Stream id below which entries are older than the TTL.
@@ -430,27 +470,31 @@ impl Store for RedisStore {
         Ok(self.conn().get(recipient_key(recipient)).await?)
     }
 
-    async fn enqueue(
+    async fn enqueue_all(
         &self,
         mediation: &str,
         recipient: &str,
-        message: &str,
+        messages: &[String],
         now: u64,
         limits: QueueLimits,
-    ) -> Result<Option<String>> {
-        Ok(redis::Script::new(&ENQUEUE)
-            .key(queue_key(mediation))
+    ) -> Result<Option<Vec<String>>> {
+        if messages.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let script = redis::Script::new(&ENQUEUE);
+        let mut call = script.prepare_invoke();
+        call.key(queue_key(mediation))
             .key(bytes_key(mediation))
             .arg(min_id(now, limits.ttl_secs))
             .arg(limits.max_messages)
             .arg(limits.max_bytes)
             .arg(recipient)
-            .arg(message.len())
-            .arg(message)
             .arg(limits.ttl_secs.max(1))
-            .arg(body_prefix(mediation))
-            .invoke_async(&mut self.conn())
-            .await?)
+            .arg(body_prefix(mediation));
+        for message in messages {
+            call.arg(message);
+        }
+        Ok(call.invoke_async(&mut self.conn()).await?)
     }
 
     async fn summary(
@@ -550,15 +594,21 @@ impl Store for RedisStore {
         &self,
         relay: &PendingRelay,
         due: u64,
-        max_pending: usize,
+        limits: RelayLimits,
     ) -> Result<bool> {
         let stored: i64 = redis::Script::new(SCHEDULE_RELAY)
             .key(RELAY_DUE)
             .key(RELAY_ITEMS)
+            .key(RELAY_HOSTS)
+            .key(RELAY_BYTES)
             .arg(&relay.id)
             .arg(due)
             .arg(serde_json::to_string(relay)?)
-            .arg(max_pending)
+            .arg(relay.destination())
+            .arg(relay.bytes())
+            .arg(limits.pending)
+            .arg(limits.per_destination)
+            .arg(limits.bytes)
             .invoke_async(&mut self.conn())
             .await?;
         Ok(stored == 1)
@@ -584,14 +634,16 @@ impl Store for RedisStore {
             .collect()
     }
 
-    async fn finish_relay(&self, id: &str) -> Result<()> {
-        let _: () = redis::pipe()
-            .atomic()
-            .zrem(RELAY_DUE, id)
-            .ignore()
-            .hdel(RELAY_ITEMS, id)
-            .ignore()
-            .query_async(&mut self.conn())
+    async fn finish_relay(&self, relay: &PendingRelay) -> Result<()> {
+        let _: i64 = redis::Script::new(FINISH_RELAY)
+            .key(RELAY_DUE)
+            .key(RELAY_ITEMS)
+            .key(RELAY_HOSTS)
+            .key(RELAY_BYTES)
+            .arg(&relay.id)
+            .arg(relay.destination())
+            .arg(relay.bytes())
+            .invoke_async(&mut self.conn())
             .await?;
         Ok(())
     }
@@ -661,6 +713,23 @@ impl Store for RedisStore {
             .invoke_async(&mut self.conn())
             .await?;
         Ok(())
+    }
+
+    async fn claim_ring(&self, mediation: &str, now: u64, interval_secs: u64) -> Result<bool> {
+        // Redis refuses an expiry of 0; no interval means nothing to hold.
+        // The key expires on its own, so a removed mediation leaves nothing.
+        if interval_secs == 0 {
+            return Ok(true);
+        }
+        let reply: Option<String> = redis::cmd("SET")
+            .arg(ring_key(mediation))
+            .arg(now)
+            .arg("NX")
+            .arg("EX")
+            .arg(interval_secs)
+            .query_async(&mut self.conn())
+            .await?;
+        Ok(reply.is_some())
     }
 }
 

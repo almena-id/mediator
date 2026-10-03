@@ -71,6 +71,7 @@ impl LiveHub {
                 .or_default()
                 .push((session.id, session.sender.clone()));
             session.live = Some(mediation.to_owned());
+            crate::metrics::METRICS.live_session_opened();
         }
     }
 
@@ -78,6 +79,7 @@ impl LiveHub {
         let Some(mediation) = session.live.take() else {
             return;
         };
+        crate::metrics::METRICS.live_session_closed();
         if let Ok(mut sessions) = self.sessions.lock()
             && let Some(list) = sessions.get_mut(&mediation)
         {

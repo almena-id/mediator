@@ -82,6 +82,7 @@ pub async fn handle(
                 return Ok(Handled::Problem(Problem::InvalidBody));
             };
             let removed = store.remove(requester, &ids).await?;
+            crate::metrics::METRICS.acknowledged(removed as u64);
             tracing::debug!(mediation = %requester, removed, "messages received");
             status(mediator, requester, recipient, message, live).await
         }

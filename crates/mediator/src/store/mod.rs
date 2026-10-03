@@ -74,6 +74,33 @@ pub struct PendingRelay {
     pub retries: u32,
 }
 
+impl PendingRelay {
+    /// The host it goes to: what [`RelayLimits::per_destination`] counts.
+    pub fn destination(&self) -> String {
+        url::Url::parse(&self.uri)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| self.uri.clone())
+    }
+
+    /// What it weighs: what [`RelayLimits::bytes`] counts.
+    pub fn bytes(&self) -> u64 {
+        self.message.len() as u64
+    }
+}
+
+/// How many relays may wait for a retry, so that destinations that stay down
+/// (or never answer) cannot fill the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayLimits {
+    /// Relays waiting in all.
+    pub pending: usize,
+    /// Relays waiting for one destination host.
+    pub per_destination: usize,
+    /// Bytes of the relays waiting in all.
+    pub bytes: u64,
+}
+
 /// Queue limits, from the configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueLimits {
@@ -116,8 +143,18 @@ pub trait Store: Send + Sync {
     /// The mediation that registered `recipient`, if any.
     async fn mediation_of(&self, recipient: &str) -> Result<Option<String>>;
 
-    /// Appends a message to the mediation's queue. `None` when the queue is
-    /// full: as many messages or as many bytes as the limits allow.
+    /// Appends messages to the mediation's queue, all of them or none: `None`
+    /// when they would not all fit (as many messages or as many bytes as the
+    /// limits allow), so a sender's retry never duplicates part of them.
+    async fn enqueue_all(
+        &self,
+        mediation: &str,
+        recipient: &str,
+        messages: &[String],
+        now: u64,
+        limits: QueueLimits,
+    ) -> Result<Option<Vec<String>>>;
+    /// One message: [`Store::enqueue_all`] of one.
     async fn enqueue(
         &self,
         mediation: &str,
@@ -125,7 +162,12 @@ pub trait Store: Send + Sync {
         message: &str,
         now: u64,
         limits: QueueLimits,
-    ) -> Result<Option<String>>;
+    ) -> Result<Option<String>> {
+        let ids = self
+            .enqueue_all(mediation, recipient, &[message.to_owned()], now, limits)
+            .await?;
+        Ok(ids.and_then(|ids| ids.into_iter().next()))
+    }
     /// Counts over the queue, or over `recipient`'s messages in it.
     async fn summary(
         &self,
@@ -151,12 +193,13 @@ pub trait Store: Send + Sync {
     async fn hit(&self, key: &str, window_secs: u64, now: u64) -> Result<u64>;
 
     /// Stores `relay` to be tried again at `due` (epoch seconds), replacing
-    /// any entry with its id. `false` when `max_pending` relays already wait.
+    /// any entry with its id. A new one is refused (`false`) when it would go
+    /// over any of the `limits`.
     async fn schedule_relay(
         &self,
         relay: &PendingRelay,
         due: u64,
-        max_pending: usize,
+        limits: RelayLimits,
     ) -> Result<bool>;
     /// Up to `limit` relays due by `now`. They are leased for `lease_secs`:
     /// until [`Store::schedule_relay`] or [`Store::finish_relay`] is called or
@@ -168,7 +211,7 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<Vec<PendingRelay>>;
     /// Forgets a relay: delivered, or given up.
-    async fn finish_relay(&self, id: &str) -> Result<()>;
+    async fn finish_relay(&self, relay: &PendingRelay) -> Result<()>;
 
     /// Registers the mediation's device for `service`, replacing the one it
     /// had, or removes it (`None`).
@@ -189,6 +232,10 @@ pub trait Store: Send + Sync {
     /// The wallet picked up: the next push may go `min_interval_secs` after
     /// the last one.
     async fn release_push(&self, mediation: &str, now: u64, min_interval_secs: u64) -> Result<()>;
+    /// Takes the turn to ring the mediation for a call: `false` if a ring
+    /// went out less than `interval_secs` ago. Independent of the wake-up
+    /// turn of [`Store::claim_push`]; with an interval of 0 it always is.
+    async fn claim_ring(&self, mediation: &str, now: u64, interval_secs: u64) -> Result<bool>;
 }
 
 /// Opens the store named by `url`: `memory://` for the in-process store,
@@ -370,6 +417,50 @@ pub(crate) mod contract {
             std::slice::from_ref(&r2)
         );
 
+        // Several at once: all of them, or none when they do not all fit.
+        let few = QueueLimits {
+            ttl_secs: 3600,
+            max_messages: 3,
+            max_bytes: 100,
+        };
+        let m4 = format!("did:peer:m4-{tag}");
+        let batch = |n: usize| vec!["x".to_owned(); n];
+        assert!(
+            store
+                .enqueue_all(&m4, &r3, &batch(4), now, few)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.summary(&m4, None, now, 3600).await.unwrap().count, 0);
+        let ids = store
+            .enqueue_all(&m4, &r3, &batch(2), now, few)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(
+            store
+                .enqueue_all(&m4, &r3, &batch(2), now, few)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.summary(&m4, None, now, 3600).await.unwrap().count, 2);
+        let bytes = QueueLimits {
+            max_messages: 100,
+            max_bytes: 3,
+            ..few
+        };
+        assert!(
+            store
+                .enqueue_all(&m4, &r3, &["ab".to_owned(), "cd".to_owned()], now, bytes)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.remove(&m4, &ids).await.unwrap();
+
         // The byte limit: full at 5 bytes, freed by pickup and by expiry.
         let tight = QueueLimits {
             ttl_secs: 3600,
@@ -462,20 +553,25 @@ pub(crate) mod contract {
         // Relays: due in order, leased while being tried, capped.
         let relay = |n: u32| PendingRelay {
             id: format!("relay-{tag}-{n}"),
-            uri: "https://elsewhere.example/didcomm".into(),
+            uri: format!("https://{tag}.example/didcomm"),
             message: format!("payload {n}"),
             retries: n,
+        };
+        let roomy = RelayLimits {
+            pending: 1000,
+            per_destination: 1000,
+            bytes: 1 << 30,
         };
         let far = now + 1_000_000;
         assert!(
             store
-                .schedule_relay(&relay(1), far + 5, 1000)
+                .schedule_relay(&relay(1), far + 5, roomy)
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .schedule_relay(&relay(2), far + 30, 1000)
+                .schedule_relay(&relay(2), far + 30, roomy)
                 .await
                 .unwrap()
         );
@@ -500,11 +596,18 @@ pub(crate) mod contract {
         // Rescheduled, and finished.
         let mut again = relay(1);
         again.retries = 2;
-        assert!(store.schedule_relay(&again, far + 200, 1000).await.unwrap());
+        assert!(
+            store
+                .schedule_relay(&again, far + 200, roomy)
+                .await
+                .unwrap()
+        );
         let later = store.due_relays(far + 300, 60, 10).await.unwrap();
         assert!(later.contains(&again) && later.contains(&relay(2)));
-        store.finish_relay(&again.id).await.unwrap();
-        store.finish_relay(&relay(2).id).await.unwrap();
+        store.finish_relay(&again).await.unwrap();
+        store.finish_relay(&relay(2)).await.unwrap();
+        // Finishing twice (two workers) counts it out once.
+        store.finish_relay(&relay(2)).await.unwrap();
         assert!(
             store
                 .due_relays(far + 10_000, 60, 10)
@@ -513,15 +616,73 @@ pub(crate) mod contract {
                 .iter()
                 .all(|r| !r.id.contains(&tag))
         );
-        // Nothing more than `max_pending` waits.
+        // Nothing more than the limits wait: in all, for one destination,
+        // in bytes. Rescheduling one that waits is always fine.
+        let one_each = RelayLimits {
+            per_destination: 1,
+            ..roomy
+        };
         assert!(
             store
-                .schedule_relay(&relay(3), far + 5, 1000)
+                .schedule_relay(&relay(3), far + 5, one_each)
                 .await
                 .unwrap()
         );
-        assert!(!store.schedule_relay(&relay(4), far + 5, 1).await.unwrap());
-        store.finish_relay(&relay(3).id).await.unwrap();
+        assert!(
+            !store
+                .schedule_relay(&relay(4), far + 5, one_each)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .schedule_relay(&relay(3), far + 9, one_each)
+                .await
+                .unwrap()
+        );
+        let elsewhere = PendingRelay {
+            id: format!("relay-{tag}-elsewhere"),
+            uri: format!("https://other-{tag}.example/didcomm"),
+            ..relay(4)
+        };
+        assert!(
+            store
+                .schedule_relay(&elsewhere, far + 5, one_each)
+                .await
+                .unwrap()
+        );
+        let tight = RelayLimits {
+            bytes: relay(3).bytes() + elsewhere.bytes(),
+            ..roomy
+        };
+        assert!(
+            !store
+                .schedule_relay(&relay(4), far + 5, tight)
+                .await
+                .unwrap()
+        );
+        store.finish_relay(&elsewhere).await.unwrap();
+        assert!(
+            store
+                .schedule_relay(&relay(4), far + 5, tight)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .schedule_relay(
+                    &relay(5),
+                    far + 5,
+                    RelayLimits {
+                        pending: 1,
+                        ..roomy
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        store.finish_relay(&relay(3)).await.unwrap();
+        store.finish_relay(&relay(4)).await.unwrap();
 
         let key = format!("rate-{tag}");
         assert_eq!(store.hit(&key, 60, now).await.unwrap(), 1);
@@ -541,6 +702,10 @@ pub(crate) mod contract {
             token: "abcd".into(),
             platform: None,
         };
+        let voip = Device {
+            token: "ef01".into(),
+            platform: None,
+        };
         assert!(store.devices(&m1).await.unwrap().is_empty());
         store
             .set_device(&m1, Service::Apns, Some(&iphone))
@@ -554,13 +719,23 @@ pub(crate) mod contract {
             .set_device(&m1, Service::Fcm, Some(&newer))
             .await
             .unwrap();
+        store
+            .set_device(&m1, Service::ApnsVoip, Some(&voip))
+            .await
+            .unwrap();
         assert_eq!(
             store.devices(&m1).await.unwrap(),
             [
                 (Service::Fcm, newer.clone()),
-                (Service::Apns, iphone.clone())
+                (Service::Apns, iphone.clone()),
+                (Service::ApnsVoip, voip.clone())
             ]
         );
+        store
+            .set_device(&m1, Service::ApnsVoip, None)
+            .await
+            .unwrap();
+        assert_eq!(store.devices(&m1).await.unwrap().len(), 2);
         store.remove_device(&m1, Service::Fcm, "t1").await.unwrap();
         assert_eq!(store.devices(&m1).await.unwrap().len(), 2);
         store.remove_device(&m1, Service::Fcm, "t2").await.unwrap();
@@ -579,6 +754,13 @@ pub(crate) mod contract {
         // Releasing with nothing claimed is harmless.
         store.release_push(&r3, now, 60).await.unwrap();
         assert!(store.claim_push(&r3, now, 3600).await.unwrap());
+
+        // Rings: one per interval, whatever the wake-up turn says.
+        assert!(store.claim_ring(&m1, now, 60).await.unwrap());
+        assert!(!store.claim_ring(&m1, now + 59, 60).await.unwrap());
+        assert!(store.claim_ring(&m2, now, 60).await.unwrap());
+        assert!(store.claim_ring(&r3, now, 0).await.unwrap());
+        assert!(store.claim_ring(&r3, now, 0).await.unwrap());
     }
 
     fn uuid() -> String {

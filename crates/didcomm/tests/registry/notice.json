@@ -1,0 +1,97 @@
+{
+  "about": "A holder notice the registry API (registry_api.didcomm) packed.",
+  "mediator": {
+    "document": {
+      "id": "did:web:mediator.example.org",
+      "verificationMethod": [
+        {
+          "id": "did:web:mediator.example.org#key-x25519",
+          "type": "JsonWebKey2020",
+          "controller": "did:web:mediator.example.org",
+          "publicKeyJwk": {
+            "kty": "OKP",
+            "crv": "X25519",
+            "x": "2lyoeerRp3b97QjnYUa7KY2BJXdQ7OVjwlPNbBKfSm0"
+          }
+        }
+      ],
+      "keyAgreement": [
+        "did:web:mediator.example.org#key-x25519"
+      ],
+      "service": [
+        {
+          "id": "did:web:mediator.example.org#didcomm",
+          "type": "DIDCommMessaging",
+          "serviceEndpoint": [
+            {
+              "uri": "https://mediator.example.org/didcomm",
+              "accept": [
+                "didcomm/v2"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "secret": {
+      "kid": "did:web:mediator.example.org#key-x25519",
+      "kty": "OKP",
+      "crv": "X25519",
+      "x": "2lyoeerRp3b97QjnYUa7KY2BJXdQ7OVjwlPNbBKfSm0",
+      "d": "eLjNPst00KbkKVB0c5oeOLtIL0lmvVozA7JuqJ_PIV8"
+    }
+  },
+  "issuer": {
+    "document": {
+      "@context": [
+        "https://www.w3.org/ns/did/v1",
+        "https://w3id.org/security/multikey/v1"
+      ],
+      "id": "did:web:almena.id:ids:idn_notice",
+      "verificationMethod": [
+        {
+          "id": "did:web:almena.id:ids:idn_notice#z6LSeY6dEz5MebCMBLFtS3fekX13ntgno85kfMqj1zUHUVYg",
+          "type": "Multikey",
+          "controller": "did:web:almena.id:ids:idn_notice",
+          "publicKeyMultibase": "z6LSeY6dEz5MebCMBLFtS3fekX13ntgno85kfMqj1zUHUVYg"
+        }
+      ],
+      "keyAgreement": [
+        "did:web:almena.id:ids:idn_notice#z6LSeY6dEz5MebCMBLFtS3fekX13ntgno85kfMqj1zUHUVYg"
+      ]
+    }
+  },
+  "holder": {
+    "did": "did:peer:2.Vz6MkwVmTaKEXSDkacbVJgPq4Fyanz3c8wuc7dSsTt2WsuXnX.Ez6LSgXHsPdK3HsLN13msaWJZfRd92X7w21X6jyzjFQPkicMY.SeyJ0IjoiZG0iLCJzIjp7InVyaSI6ImRpZDp3ZWI6bWVkaWF0b3IuZXhhbXBsZS5vcmciLCJhIjpbImRpZGNvbW0vdjIiXX19",
+    "secret": {
+      "kid": "did:peer:2.Vz6MkwVmTaKEXSDkacbVJgPq4Fyanz3c8wuc7dSsTt2WsuXnX.Ez6LSgXHsPdK3HsLN13msaWJZfRd92X7w21X6jyzjFQPkicMY.SeyJ0IjoiZG0iLCJzIjp7InVyaSI6ImRpZDp3ZWI6bWVkaWF0b3IuZXhhbXBsZS5vcmciLCJhIjpbImRpZGNvbW0vdjIiXX19#key-2",
+      "kty": "OKP",
+      "crv": "X25519",
+      "x": "SAPJzL--MPAyVlRQXyDaky9O6kmgc-LtCXiTRZyA5Ss",
+      "d": "gK8jpDtB_JGmTUKxzJ54BLY5GT3bUiSUoo82rtGJY1k"
+    }
+  },
+  "message": {
+    "id": "e4b034ac-adc2-4bfc-b49a-9f7530baabf2",
+    "type": "https://almena.id/protocols/application/1.0/status",
+    "typ": "application/didcomm-plain+json",
+    "from": "did:web:almena.id:ids:idn_notice",
+    "to": [
+      "did:peer:2.Vz6MkwVmTaKEXSDkacbVJgPq4Fyanz3c8wuc7dSsTt2WsuXnX.Ez6LSgXHsPdK3HsLN13msaWJZfRd92X7w21X6jyzjFQPkicMY.SeyJ0IjoiZG0iLCJzIjp7InVyaSI6ImRpZDp3ZWI6bWVkaWF0b3IuZXhhbXBsZS5vcmciLCJhIjpbImRpZGNvbW0vdjIiXX19"
+    ],
+    "created_time": 1791060565,
+    "body": {
+      "application": "0b7c1e52-4f3a-4c8e-9d61-2a5f0e9b7c13",
+      "status": "issued",
+      "credential_type": "membership",
+      "credential_name": {
+        "en": "Membership",
+        "es": "Afiliaci\u00f3n"
+      },
+      "issuer": "Club",
+      "collect": "https://api.almena.id/api/v1/applications/0b7c1e52-4f3a-4c8e-9d61-2a5f0e9b7c13/collect"
+    },
+    "thid": "0b7c1e52-4f3a-4c8e-9d61-2a5f0e9b7c13"
+  },
+  "envelope": "{\"protected\":\"eyJ0eXAiOiJhcHBsaWNhdGlvbi9kaWRjb21tLWVuY3J5cHRlZCtqc29uIiwiYWxnIjoiRUNESC1FUytBMjU2S1ciLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwiZXBrIjp7Imt0eSI6Ik9LUCIsImNydiI6IlgyNTUxOSIsIngiOiJmbkRLb1hfXzhha0plTk5SZ29QcmN1OFlmWXFQQUU0b3prQzdLWnpESkFnIn0sImFwdiI6Im4weGtKT0N3TXFUVDg0RjJjVUN6dGlWMm5WcUlVQW9rcjNiRS0wM20zX2cifQ\",\"recipients\":[{\"header\":{\"kid\":\"did:web:mediator.example.org#key-x25519\"},\"encrypted_key\":\"5Zl49vZLgPjIWp8JqFQKHHGlXv-lL469o_NfLwJiq1pJol7WEBziwo1NVtjgnngT2QYXpzSNIHgJmGVsI8nd-_hFLj8Up2Cz\"}],\"iv\":\"tVr5x35pWR222j9o6HO7Ew\",\"ciphertext\":\"-Loe1tHaZPJBfN1GoGIs3Cd5tYfK7WCzrQYRq_giAo1tK6Y6KI3uFVjWyTJSWcT-k5vxAm0zxIUDCCHRja3yr8YSdnaW6wuh6hLt-lSABTpODrU-OrxZxxmFKrfuyZ0NR6EOKkYfDXO7wvBagEeKvM6ob_bnES6I96a3sCFrjsv3k_EEHNhzT4kKr1YY0r-2tVtyFz5MfvMw4J-9_pb-KWULPnn_k3BwEZcmJrxHOnqf1JhCHbdRpNxmbBKHBArBRt0QnLaXYBYUZ1crzsBjO2eYjpfN3LduKtSIGn_ZALi459oT73nNsapOE2uB-NHE934LTzEbskL6FOzZHsvDvZrX9Nibpkkck__xSVc0BXxtzG-sAt1BwkMcGXFpAlrKECUfiSzKzG_wX5usBoReMUcyBeDrHNojd5qs63wIIPjoi1QPUsO94AK3wHREJEgbo63-TSo6EZxLcYiJXgjz3NnM9xRVA9RZj6v-4zPe08L7EHTMV6HmSvgacd86PEOEIABAer9TMjum4wTq2N5c5owxfFYzZyqoZRsrsuGiXPBIFyVIY6bRXl8MxfOiqvM0NZw-lZfcM-pe4niI9YPNfkkCU7X6pxWiJiy89i9d1lki5VUPcsobyzjg6AXF1lAvqLru5ENLETwL7TVzZQz0BuJSh5yWr4xN9-8X4NBRw3-8D0WhruNQUjHjYrOR4zeT99lFOj3ENSvjsvK2Zt-LKwO_9ffCCljPXdLL_5BnKnyljLVDkAqtA32ofounVb3PImlsH_c-jQy5o0RySlNMPjIL55xIjXj-DW8GS4sQiBnWPVKmqGPVNytXJn0maWt7hKcKN2nwgjJNOfCp8Yg0V4V6Vd_R228HoZW-NeQ7c6rIYYoCfsN5BUgd5DEptVHogY21SmTjRPnzcM1UGuJL8BsrIKoFHCavS6PxC98qMCBUdZrdhSGy5lmsNu0G9jHtA8rNsoYuGgaze1AZcFjFDcZkA0brahxIgfLmALcvvCltWbNCUGZ2FxYQxxc6VexBFlrXHHxv9AHt3QrFQLAKpu9OCugdpLfuw6gTF0EKwwXJjgRxRzPcHYWcBg677tuWtV05xjhBQrYGPLGZbrfBxboIvQT8OSwA8F3qbp38XNaQg9-shsf7zXj0jZVfSuWUDPkDOYgR4xOhuU_fF9-qOCEcrJDKpS5HOvZwGUdrC9iecS5Wm6lfyxmGjvF68pfZxOfJS7nrpBgBF808UjpAl8VskdjncFpK-p7IHmYGN1EJaE-2LVWJ0_rB4VCJ916UVOiHnUlzXrAdNkEUto6LWuQHn4Wt4Q2JaYeECorcRImLFF_X7WxbCj1MvwHcFgugnhz5qNJLLvDtIcm1r-GEb1xcTC19tW0jE1CKi3rc1-s4b8ymPRgo1DNJU6WY40vkdetF-4AObVPEdtYp4CCcwOT5slthUlQJkIbAnoTrb-1vsOK5dyGUfrs06AkJ8poWhmQRIRhFkW9K92yEkR8YvX0hMDFMQJVBaNF44iPWz0FEyEHAfkdoHUPWetOuFIFKNyqIljnmPHnvVfFSiSvpHhpcgdICVgM1SGhF54D21w4QkOG-01fxSvWKUiXFii8VNJOF6fXwmeejlSAqYBAhlUOm2xxzDLUSM3O9AxyqZ9AQzBsxnAWUoM6j_m2YKXhrsSoDLPSK4UYPf9rbNDlLz59rwAMKY-MTq4n08EWYaWklkfNASUiSOyJkI4BTxu22Qgf8KUIGEm6X6_AAVgzziR00rEZpub01nTFW8KcUjaOaQFbPbkWwz4OQX1TRXuK_CX280a4eRaTxyxqUTRgoMubrYRkJ280rH1QtV80sZNnsrS__gecqs-xHtI7tW8gFu4kpyKvDbZublU9VDApZ_AQ4jTTlK6ZgZCa8D0F5JneWX6fPXVEjTt0N5Z017Nq3Vp5K0skm52zawArN6ioQVwYaNj5umiXS6YoPRJq5ItqP7USsPvHgp582c8T5hCjJJyB5mYvbheF6lTcv5HP0awlr-ZK_Nba4qCe995kRYJIuDaTRSAzcxfLwUjla7KKORvpht5xcXgYAccq9w4EotBi3IiCXZMg4j0tDjcwEaeoQbrAkrU7pAD9rP5NgWDT9NZ0fl4HsgZHFzdIp6Yx95qm63BHqzTPmq7XFGf9tJWxZAbU475nYnnjcRbK-tWwfTw0nkN45q96-wPgJMWrrDO7avKvPev26W2UgxzoRqzyH0axFqvok8cSTHMXIxUPT8buTaiuxgnO0FGoP4CwrxJ6CpWAhxGcCLgKaA9gDeUupmhSCfwEJ4XCsoBcC5LARk5i-kW-lQ9B6lX21LOa2jSoevy6w6UTOl0kwf2e9XAYpC1gZmk6-DRe_XYf3i_4vt-sUd8ezfGfJfeh9I69YN_wOt1McTkZ90Tot_-uYyYKj0sUVzIEjSmBdD0wxBpKYMTZoV2I_4dcFl5zTvxEJJriEqbmKPQhqWnZxxJOBebiFJ5UZNQ1wGoT6P0EVfUy5Qo5qAeDy84AwLjfXP6kh5AZRhM_JBADBBUhQCseDNbHvBJ7ePQNm8X0CLrVoiGu3mp68XMDwlEixYK6gGbbAOGk34kIk7tKf2heQJvM4nQTbyniUEsa_0AU3g9UF8IJ-uqYWef9gsRbtgnUwGpMFEQyt0ygOUMF5xgmfJa-RIPUsQvBG9zHLvxZe0k3ShgaUdYMg9GkCF6078XYkBdA0Ps7PutDmspyVE79HTUh53-yB08thrQFDLxe6DhrzPb8hj9S7LJLbTMMOZRBPi09ng-ERtKfoHSN9Q-txzmjVWx68xtAEKJ5crtYqz6C8M-31DNuIH2_Rltu9iziGeoYYotA4dpqMmj0mLee9IAROhD95-PS80MBBa6R4PQA0LgQU6I6FKPerZLBGCGC0TYCFth-Z3b1nuNmtacRFB4NV2gmp-0ewjSrqgpOHG6q_fXMv0O1lzpmv7bWuArW3b9_QoH0s4dIPlgKoQZHYgwYLgtGqPk9pzq767xsZBK0mbL72KWisDwDBbL9JJ38ceOglKVsyuy6YvnFXqA33Cq_xB24KkqQzWLYCQmGNpI2QJkK_lgDTWiCAxkiMWsl1kocCNkbkpm_fj9r12-SftOjLGIkA8iY7fCf_TmJ8EqYAyKE4mvpC0Fs9MD2XYXRMhzdfiBoB_cI17BNkKcbt3zeCIhre0W7kwYzjB_B3OwtgVqyo_Yanbd4sXGnMtILzkxHLCcY_l4B9LGtRXyScNMT8-UnVY6OnI8SkX_OCcaaIQJjYaXqpfru8L-euektH4-nBlDgcEeCD6LL93EHZ-hc0fRPG-JOEQERv4gd5B4M1k8vibSr8kaDn5GpbdCtivIFD0GYCYXxVIIRHPqY2BkGijmhuS1vP9TKYCmrLKAQ7XpyBEPLLdCvf71mAbLAjTe55DBCbvPYU1QPGLAiuQ_08NQGH54FbhRZJaVtGlkSgH013oFhLdpyOmzU2dlxfIQ6NjA\",\"tag\":\"pYVgV8QyR4XvlIpRw_lQ_IARzG6pqo5uDGf92AHtUrU\"}"
+}

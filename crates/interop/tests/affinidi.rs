@@ -276,6 +276,7 @@ const LIMITS: Limits = Limits {
     },
     max_recipient_dids: 3,
     push_min_interval_secs: 60,
+    push_ring_interval_secs: 5,
     recipient_proof: true,
     mediation_ttl_secs: 0,
 };

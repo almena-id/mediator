@@ -12,41 +12,55 @@ use std::time::Duration;
 
 use almena_didcomm::did::did_of;
 use almena_didcomm::message::now;
-use almena_didcomm::{ContentEncryption, b64, route};
+use almena_didcomm::{ContentEncryption, Urgency, b64, route_with};
 use sha2::{Digest, Sha256};
 
 use super::{Mediator, ReceiveError};
 use crate::identity::DIDCOMM_PATH;
 use crate::metrics::{Forward, METRICS, Retry};
-use crate::store::{PendingRelay, Store};
+use crate::store::{PendingRelay, RelayLimits, Store};
 use crate::transport::Transport;
 
 /// Seconds before each retry after the first attempt.
 const BACKOFF: [u64; 4] = [5, 30, 120, 600];
-/// Relays waiting for a retry, at most: a destination that stays down
-/// must not fill the store with copies.
-const MAX_PENDING: usize = 1000;
-/// How long a relay being tried is kept from other workers.
+/// Relays waiting for a retry, at most: destinations that stay down must not
+/// fill the store with copies, and one of them must not crowd out the rest.
+const LIMITS: RelayLimits = RelayLimits {
+    pending: 1000,
+    per_destination: 50,
+    bytes: 128 * 1024 * 1024,
+};
+/// How long a relay being tried is kept from other workers: longer than a
+/// round takes, its attempts being made at once and bounded by the
+/// transport's timeout.
 const LEASE_SECS: u64 = 60;
 /// Relays tried per round, and how often a round runs.
 const BATCH: usize = 16;
 const TICK: Duration = Duration::from_secs(1);
 
+/// Routes `payloads` to `next` and sends them; the `forward`s around them
+/// carry `urgency` on, as the one that brought them here did.
 pub async fn relay(
     mediator: &Mediator,
     next: &str,
     payloads: Vec<String>,
+    urgency: Urgency,
 ) -> Result<(), ReceiveError> {
     let Some(transport) = mediator.transport() else {
         return Err(ReceiveError::UnknownRecipient);
     };
     let own = &mediator.identity().did;
+    let own_endpoint = own_endpoints(mediator);
+    // Route them all before sending any: a payload that cannot be routed
+    // refuses the forward whole, so the sender's retry duplicates nothing.
+    let mut routed_all = Vec::with_capacity(payloads.len());
     for payload in payloads {
-        let routed = route(
+        let routed = route_with(
             payload,
             next,
             mediator.resolver(),
             ContentEncryption::A256CbcHs512,
+            urgency,
         )
         .await
         .map_err(|err| {
@@ -59,13 +73,15 @@ pub async fn relay(
         };
         // A route that comes back to this mediator means `next` names us as its
         // mediator without having registered: nowhere to deliver.
-        let own_endpoint = own_endpoints(mediator);
         if routed.first_hop.as_deref().map(did_of) == Some(own.as_str())
             || own_endpoint.contains(&uri)
         {
             return Err(ReceiveError::UnknownRecipient);
         }
-        deliver(mediator.store(), transport.as_ref(), uri, routed.message).await;
+        routed_all.push((uri, routed.message));
+    }
+    for (uri, message) in routed_all {
+        deliver(mediator.store(), transport.as_ref(), uri, message).await;
     }
     Ok(())
 }
@@ -101,7 +117,7 @@ pub(super) async fn deliver(
         retries: 0,
     };
     match store
-        .schedule_relay(&relay, now() + BACKOFF[0], MAX_PENDING)
+        .schedule_relay(&relay, now() + BACKOFF[0], LIMITS)
         .await
     {
         Ok(true) => METRICS.forward(Forward::RelayScheduled, 1),
@@ -125,38 +141,51 @@ fn relay_id(uri: &str, message: &str) -> String {
     b64::encode(hash.finalize())
 }
 
-/// Tries the relays due by `now` once each; the ones that fail again are
-/// rescheduled, or dropped after the last retry.
+/// Tries the relays due by `now` once each, all at once: one destination
+/// that never answers holds up none of the others. The ones that fail again
+/// are rescheduled, or dropped after the last retry.
 pub async fn retry_due(
     store: &dyn Store,
     transport: &dyn Transport,
     now: u64,
 ) -> anyhow::Result<()> {
-    for relay in store.due_relays(now, LEASE_SECS, BATCH).await? {
-        let attempt = relay.retries + 2;
-        match transport.post_didcomm(&relay.uri, &relay.message).await {
-            Ok(()) => {
-                tracing::debug!(uri = %relay.uri, attempt, "forward relayed");
-                METRICS.relay_retry(Retry::Delivered);
-                store.finish_relay(&relay.id).await?;
-            }
-            Err(err) => {
-                let next = relay.retries as usize + 1;
-                if let Some(wait) = BACKOFF.get(next) {
-                    tracing::info!(uri = %relay.uri, attempt, error = %format!("{err:#}"), "relay failed");
-                    METRICS.relay_retry(Retry::Rescheduled);
-                    let relay = PendingRelay {
-                        retries: relay.retries + 1,
-                        ..relay
-                    };
-                    store
-                        .schedule_relay(&relay, now + wait, MAX_PENDING)
-                        .await?;
-                } else {
-                    tracing::warn!(uri = %relay.uri, attempt, error = %format!("{err:#}"), "relay abandoned after retries");
-                    METRICS.relay_retry(Retry::Abandoned);
-                    store.finish_relay(&relay.id).await?;
-                }
+    let due = store.due_relays(now, LEASE_SECS, BATCH).await?;
+    let tried = due
+        .into_iter()
+        .map(|relay| retry(store, transport, relay, now));
+    futures_util::future::join_all(tried)
+        .await
+        .into_iter()
+        .collect()
+}
+
+async fn retry(
+    store: &dyn Store,
+    transport: &dyn Transport,
+    relay: PendingRelay,
+    now: u64,
+) -> anyhow::Result<()> {
+    let attempt = relay.retries + 2;
+    match transport.post_didcomm(&relay.uri, &relay.message).await {
+        Ok(()) => {
+            tracing::debug!(uri = %relay.uri, attempt, "forward relayed");
+            METRICS.relay_retry(Retry::Delivered);
+            store.finish_relay(&relay).await?;
+        }
+        Err(err) => {
+            let next = relay.retries as usize + 1;
+            if let Some(wait) = BACKOFF.get(next) {
+                tracing::info!(uri = %relay.uri, attempt, error = %format!("{err:#}"), "relay failed");
+                METRICS.relay_retry(Retry::Rescheduled);
+                let relay = PendingRelay {
+                    retries: relay.retries + 1,
+                    ..relay
+                };
+                store.schedule_relay(&relay, now + wait, LIMITS).await?;
+            } else {
+                tracing::warn!(uri = %relay.uri, attempt, error = %format!("{err:#}"), "relay abandoned after retries");
+                METRICS.relay_retry(Retry::Abandoned);
+                store.finish_relay(&relay).await?;
             }
         }
     }
@@ -170,6 +199,7 @@ pub fn spawn_retries(store: Arc<dyn Store>, transport: Arc<dyn Transport>) {
         loop {
             tick.tick().await;
             if let Err(err) = retry_due(store.as_ref(), transport.as_ref(), now()).await {
+                METRICS.store_error();
                 tracing::warn!(error = %format!("{err:#}"), "relay retries failed");
             }
         }

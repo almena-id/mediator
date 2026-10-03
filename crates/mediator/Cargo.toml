@@ -37,6 +37,7 @@ utoipa = { version = "6.0.0", features = ["axum_extras"] }
 utoipa-axum = "0.3.0"
 utoipa-scalar = { version = "0.4.0", features = ["axum"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }

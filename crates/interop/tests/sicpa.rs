@@ -151,6 +151,7 @@ fn our_options(anon: ContentEncryption, protect_sender: bool) -> PackOptions {
         forward: false,
         protect_sender,
         anoncrypt_enc: anon,
+        ..PackOptions::default()
     }
 }
 

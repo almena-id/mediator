@@ -10,16 +10,18 @@ It shares nothing with `../wallet` except the protocol; the wallet may later dep
 
 Cargo workspace:
 
-- `crates/didcomm/` — `almena-didcomm`: DIDComm v2.0 library (keys, JWS, JWE anoncrypt/authcrypt, messages, pack/unpack, `did:key`/`did:peer` resolution, possession proofs). No HTTP or storage.
+- `crates/didcomm/` — `almena-didcomm`: DIDComm v2.0 library (keys, JWS, JWE anoncrypt/authcrypt, messages, pack/unpack, `did:key`/`did:peer` resolution, walking a `did:webvh` log, possession proofs). No HTTP or storage.
   - `tests/spec/appendix.json` — the spec's Appendix A–C test vectors (errata noted in the file).
+  - `tests/webvh/registry-did.jsonl` — a `did:webvh` log the registry (`../api`) wrote; the wallet's resolver is tested with the same one.
+  - `tests/registry/notice.json` — a holder notice the registry (`../api`, `registry_api.didcomm`) packed: a `forward` to the mediator around an authcrypt message to a `did:peer:2`; `tests/registry_notice.rs` unpacks it as the mediator and the wallet would. The API writes it again with `uv run python -m tests.notice_fixture`.
 - `crates/interop/` — `almena-interop`, tests only: `almena-didcomm` and the mediator against didcomm-rust (SICPA) and Affinidi's DIDComm library, both ways. Nothing else depends on it.
 - `interop/veramo/` — a Veramo client run against a live mediator (`node check.ts`); Veramo does not conform yet, see SPEC.md §10.
 - `crates/mediator/` — `almena-mediator`: the service.
   - `config` reads `ALMENA_*` env vars; `identity` holds the mediator's `did:web`, keys (`ALMENA_KEYS_PATH`) and DID document.
   - `store/`: the `Store` trait with Redis and in-memory implementations, and a contract test both must pass.
   - `dispatch/`: unpacks what reaches `/didcomm` or `/ws` and dispatches — `protocols.rs` (Trust Ping, Discover Features, problem reports), `mediation.rs` (Coordinate Mediation, `forward`), `pickup.rs` (Message Pickup), `live.rs` (live-delivery sessions), `relay.rs` (forwarding to other mediators), `devices.rs` (push protocols: device registration), `turn.rs` (TURN 1.0, Almena's own: time-limited credentials for the coturn relay, nothing stored).
-  - `push/`: wake-ups through FCM (`fcm.rs`) and APNs (`apns.rs`), coalescing, the `Pusher` trait.
-  - `transport.rs`: outbound HTTPS with the SSRF guard, and the `did:web` resolver. `oob.rs`: the Out-of-Band invitation.
+  - `push/`: wake-ups and call rings through FCM (`fcm.rs`) and APNs (`apns.rs`, VoIP pushes too), coalescing, the `Pusher` trait.
+  - `transport.rs`: outbound HTTPS with the SSRF guard, and the `did:web` / `did:webvh` resolver. `oob.rs`: the Out-of-Band invitation.
   - `routes` is the axum router: HTTP and WebSocket endpoints, rate limit, HTTP status mapping.
   - `home.rs`: the page at `/` (the status, version and DID `/health` also gives, the invitation QR and its `almena://` link); the icon (`crates/mediator/assets/icon.png`, compiled in) is the favicon. Its `layout` wraps every browser page (also `/oob`) in the header and footer of Almena's portals (catalog, registry, status) and their typefaces: Chakra Petch (brand, headings), Inter (text), JetBrains Mono (values), compiled in from `crates/mediator/assets/fonts` (SIL OFL, licences beside them) and served at `/fonts/{name}`, so a page never calls a third party.
   - `metrics.rs`: Prometheus counters, served by their own listener (`ALMENA_METRICS_ADDR`), not by the router.

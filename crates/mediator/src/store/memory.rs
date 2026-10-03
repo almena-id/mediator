@@ -8,8 +8,8 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
 use super::{
-    AddRecipient, PendingRelay, QueueLimits, QueueSummary, Queued, RemoveRecipient, Store,
-    id_millis,
+    AddRecipient, PendingRelay, QueueLimits, QueueSummary, Queued, RelayLimits, RemoveRecipient,
+    Store, id_millis,
 };
 use crate::push::{Device, Service};
 
@@ -31,6 +31,8 @@ struct Inner {
     devices: HashMap<String, BTreeMap<Service, Device>>,
     /// Mediation → (when the last push went, when the marker lapses).
     push_sent: HashMap<String, (u64, u64)>,
+    /// Mediation → when the next call ring may go.
+    rings: HashMap<String, u64>,
     /// Relay id → (when it is due, the relay).
     relays: BTreeMap<String, (u64, PendingRelay)>,
     /// Mediation → when its wallet was last active.
@@ -102,6 +104,7 @@ impl Store for MemoryStore {
             inner.queues.remove(mediation);
             inner.devices.remove(mediation);
             inner.push_sent.remove(mediation);
+            inner.rings.remove(mediation);
         }
         Ok(idle)
     }
@@ -161,29 +164,35 @@ impl Store for MemoryStore {
         Ok(self.lock()?.owners.get(recipient).cloned())
     }
 
-    async fn enqueue(
+    async fn enqueue_all(
         &self,
         mediation: &str,
         recipient: &str,
-        message: &str,
+        messages: &[String],
         now: u64,
         limits: QueueLimits,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<Vec<String>>> {
         let mut inner = self.lock()?;
-        inner.seq += 1;
-        let id = format!("{}-{}", now * 1000, inner.seq);
+        let seq = inner.seq;
+        inner.seq += messages.len() as u64;
         let queue = inner.queue(mediation, now, limits.ttl_secs);
         let bytes: u64 = queue.iter().map(|q| q.message.len() as u64).sum();
-        if queue.len() >= limits.max_messages || bytes + message.len() as u64 > limits.max_bytes {
+        let adding: u64 = messages.iter().map(|m| m.len() as u64).sum();
+        if queue.len() + messages.len() > limits.max_messages || bytes + adding > limits.max_bytes {
             return Ok(None);
         }
-        queue.push(Queued {
-            id: id.clone(),
-            recipient: recipient.to_owned(),
-            received: id_millis(&id) / 1000,
-            message: message.to_owned(),
-        });
-        Ok(Some(id))
+        let mut ids = Vec::with_capacity(messages.len());
+        for (n, message) in messages.iter().enumerate() {
+            let id = format!("{}-{}", now * 1000, seq + n as u64 + 1);
+            queue.push(Queued {
+                id: id.clone(),
+                recipient: recipient.to_owned(),
+                received: id_millis(&id) / 1000,
+                message: message.clone(),
+            });
+            ids.push(id);
+        }
+        Ok(Some(ids))
     }
 
     async fn summary(
@@ -254,11 +263,23 @@ impl Store for MemoryStore {
         &self,
         relay: &PendingRelay,
         due: u64,
-        max_pending: usize,
+        limits: RelayLimits,
     ) -> Result<bool> {
         let mut inner = self.lock()?;
-        if !inner.relays.contains_key(&relay.id) && inner.relays.len() >= max_pending {
-            return Ok(false);
+        if !inner.relays.contains_key(&relay.id) {
+            let destination = relay.destination();
+            let waiting = inner.relays.values().map(|(_, r)| r);
+            let (mut to_it, mut bytes) = (0, 0);
+            for other in waiting {
+                to_it += usize::from(other.destination() == destination);
+                bytes += other.bytes();
+            }
+            if inner.relays.len() >= limits.pending
+                || to_it >= limits.per_destination
+                || bytes + relay.bytes() > limits.bytes
+            {
+                return Ok(false);
+            }
         }
         inner.relays.insert(relay.id.clone(), (due, relay.clone()));
         Ok(true)
@@ -287,8 +308,8 @@ impl Store for MemoryStore {
             .collect())
     }
 
-    async fn finish_relay(&self, id: &str) -> Result<()> {
-        self.lock()?.relays.remove(id);
+    async fn finish_relay(&self, relay: &PendingRelay) -> Result<()> {
+        self.lock()?.relays.remove(&relay.id);
         Ok(())
     }
 
@@ -349,6 +370,17 @@ impl Store for MemoryStore {
             }
         }
         Ok(())
+    }
+
+    async fn claim_ring(&self, mediation: &str, now: u64, interval_secs: u64) -> Result<bool> {
+        let mut inner = self.lock()?;
+        if inner.rings.get(mediation).is_some_and(|&until| now < until) {
+            return Ok(false);
+        }
+        inner
+            .rings
+            .insert(mediation.to_owned(), now.saturating_add(interval_secs));
+        Ok(true)
     }
 }
 

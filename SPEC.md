@@ -1,6 +1,6 @@
 # Almena Mediator Specification
 
-Version: draft 1 (2026-09-25) · Status: describes `almena-mediator` as implemented (phases 1–6, Appendix I).
+Version: draft 1 (2026-10-03) · Status: describes `almena-mediator` as implemented (phases 1–6, Appendix I).
 
 This document specifies the Almena Mediator as a profile of, and a set of extensions to, [DIDComm Messaging v2.0][didcomm]. It does not restate DIDComm: wherever a behaviour is the one the referenced specification defines, it says so and points at it. What it does spell out is what Almena adds, restricts, interprets or leaves out.
 
@@ -26,6 +26,7 @@ The Almena Mediator is a **pure mediator**: a mailbox that accepts DIDComm encry
 | [did:key] | [did:key Method][didkey] | Wallet and test DIDs. |
 | [did:peer] | [Peer DID Method][didpeer] (numalgo 2 and 4) | Pairwise wallet DIDs. |
 | [did:web] | [did:web Method][didweb] | Mediator DIDs. |
+| [did:webvh] | [did:webvh Method 1.0][didwebvh] | DIDs of the Almena registry's tenants, issuers and verifiers. |
 | [JOSE] | [RFC 7515][rfc7515] (JWS), [RFC 7516][rfc7516] (JWE), [RFC 7517][rfc7517] (JWK), [RFC 7518][rfc7518] (JWA), [RFC 7519][rfc7519] (JWT), [RFC 8037][rfc8037] (OKP) | Envelopes, keys, possession proofs. |
 | [1PU] | [ECDH-1PU, draft-madden-jose-ecdh-1pu-04][ecdh1pu] | Authcrypt key agreement, as DIDComm v2.0 profiles it. |
 | [XC20P] | [draft-amringer-jose-chacha][xc20p] | Optional content encryption. |
@@ -33,8 +34,8 @@ The Almena Mediator is a **pure mediator**: a mailbox that accepts DIDComm encry
 | [Routing] | [Routing 2.0][routing] (DIDComm §Routing) | `forward`. |
 | [Pickup] | [Message Pickup 3.0][pickup] | Polling and live delivery. |
 | [ReturnRoute] | [Aries RFC 0092 Transports Return Route][rfc0092], as carried into DIDComm v2 | `return_route` header. |
-| [FCM] | [Aries RFC 0734 Push Notifications FCM][rfc0734] | Device registration, FCM. Written for DIDComm v1; adapted in §6.2. |
-| [APNs] | [Aries RFC 0699 Push Notifications APNs][rfc0699] | Device registration, APNs. Written for DIDComm v1; adapted in §6.2. |
+| [FCM] | [Aries RFC 0734 Push Notifications FCM][rfc0734] | Device registration, FCM. Written for DIDComm v1; adapted in §6.3. |
+| [APNs] | [Aries RFC 0699 Push Notifications APNs][rfc0699] | Device registration, APNs. Written for DIDComm v1; adapted in §6.3. |
 | [Ack] | [Aries RFC 0015 ACKs][rfc0015] | The `ack` the push protocols answer with. |
 | [TURN] | [RFC 8656][rfc8656], Traversal Using Relays around NAT | The relay the credentials of §6.9 are for. |
 | [TURN-REST] | [A REST API for Access to TURN Services, draft-uberti-behave-turn-rest-00][turnrest] | The form of those credentials (§6.9). An expired Internet-Draft, but the mechanism TURN servers implement (coturn's `use-auth-secret`). |
@@ -76,6 +77,8 @@ When packing, the sender key is the first `keyAgreement` key held that shares a 
 ### 3.3 DID methods and documents
 
 - Wallets: `did:key`, `did:peer:2`, `did:peer:4`. Mediators: `did:web` (resolved over HTTPS, cached 5 minutes).
+- The Almena registry's tenants, issuers and verifiers: `did:webvh` 1.0. Their log (`did.jsonl`) is fetched over HTTPS and walked from the first entry — SCID, hash chain, `eddsa-jcs-2022` proofs by the update keys in force, pre-rotation — and believed only if every entry holds; a deactivated DID does not resolve, and a log that asks for witnesses is refused. Cached 5 minutes. They mediate like any wallet: authcrypt from their `keyAgreement` key, the `did:webvh` as mediation DID.
+- `did:web` and `did:webvh` are resolved only with federation on (`ALMENA_FEDERATION`), since resolving them is outbound traffic (§6.8).
 - An Ed25519 `did:key` also lists its derived X25519 key under `keyAgreement`.
 - `did:peer:2` key ids are `#key-1`, `#key-2`, … in DID order; services `#service`, `#service-1`, ….
 - A short-form `did:peer:4` resolves only once its long form has been seen by the same resolver.
@@ -84,6 +87,10 @@ When packing, the sender key is the first `keyAgreement` key held that shares a 
 ### 3.4 Routing
 
 As [Routing]: `forward` messages are anoncrypted, carry the inner message as an attachment, and `next` is a DID or one of its key ids. When packing, the first `DIDCommMessaging` endpoint accepting `didcomm/v2` is used; a DID as `uri` means a mediator, whose `keyAgreement` keys go first in the routing keys.
+
+A `forward` MAY carry Almena's `urgency` header (§6.4); its only value is `"call"`, set on every `forward` of a call offer. A mediator relaying a payload (§6.7) puts the header it received on every `forward` it wraps, so the recipient's mediator still sees it.
+
+A `forward` with several attachments is taken whole or not at all: they are all queued, or all routed before any is relayed; a full queue (`507`) or an attachment that cannot be routed (`404`) leaves nothing behind, so the sender's retry duplicates nothing.
 
 Not used: rewrapping, `delay_milli`.
 
@@ -104,7 +111,8 @@ Where [DIDComm] is ambiguous, contradicts itself, or where Almena departs from i
 | D9 | Discover Features privacy advice | Vary order, add spurious entries. | Not applied: a mediator's features are public. |
 | D10 | Redirects | Only `307` followed. | Same, on every outbound request. |
 | D11 | Undeliverable replies | Deliver to the sender's endpoint. | Only to a sender authenticated by authcrypt — an unauthenticated `from` could name anyone (§6.6). |
-| D12 | Push protocols | Defined for DIDComm v1 only. | Used over v2 (§6.2). |
+| D12 | Push protocols | Defined for DIDComm v1 only. | Used over v2 (§6.3). |
+| D13 | `forward` headers | `next` and attachments only. | An `urgency: "call"` header tells the recipient's mediator to ring rather than wake (§3.4, §6.4); mediators that do not know it ignore it, as unknown headers are. |
 
 ## 5. The mediator's identity
 
@@ -134,7 +142,7 @@ One service, `<did>#didcomm`, of type `DIDCommMessaging`, with two endpoints in 
 ]
 ```
 
-(`ws://` for an `http` origin.) Push is not advertised; it is negotiated with the push protocols (§6.2).
+(`ws://` for an `http` origin.) Push is not advertised; it is negotiated with the push protocols (§6.3).
 
 ### 5.3 Rotation
 
@@ -178,6 +186,8 @@ The proof is a compact JWS ([RFC 7515][rfc7515]) whose payload is a JWT ([RFC 75
 
 The header `kid` MUST be a key of `iss`, and the signature MUST verify against that key in the `authentication` relationship of the resolved `iss` document. The mediator accepts `iat` no older than 5 minutes and no more than 1 minute in the future. A missing, malformed or failing proof yields `client_error` for that DID. The mediation DID itself needs no proof: its authcrypt already proves control.
 
+Checking a proof may mean resolving `iss` over the network, so a `recipient-update` with more `add`s that need one than `ALMENA_MAX_RECIPIENT_DIDS` is refused whole (`e.m.msg.invalid-body`), and an `add` that would go over the limit is `client_error` without its proof being checked.
+
 `ALMENA_RECIPIENT_PROOF=off` falls back to plain [CoordMed]. Implementation: `almena_didcomm::PossessionProof`.
 
 ### 6.3 Push protocols over DIDComm v2
@@ -192,8 +202,9 @@ The FCM ([RFC 0734][rfc0734]) and APNs ([RFC 0699][rfc0699]) protocols are used 
 - Authcrypted and with a granted mediation, like §6.1.
 - Offered only for the services the mediator is configured to push through; the others get `e.m.msg.unsupported-type`, and Discover Features discloses only the offered ones (role `notification-sender`).
 - One device per service per mediation; `set-device-info` replaces it. FCM requires `device_token` and `device_platform` together; APNs a hex `device_token`. All values `null` or absent removes the device; any other shape is `e.m.msg.invalid-body`.
+- **Almena extension:** the APNs messages also carry `voip_device_token`, the app's PushKit token for calls (hex, at most 200 characters, like `device_token`). One `set-device-info` describes the device whole: a `voip_device_token` absent or `null` removes the VoIP token, whatever `device_token` says. The FCM messages are unchanged: one token serves both.
 - `set-device-info` is answered with the [RFC 0015][rfc0015] ack, type `https://didcomm.org/notification/1.0/ack`, body `{"status": "OK"}`.
-- `get-device-info` is answered with `device-info`; values are `null` when nothing is registered.
+- `get-device-info` is answered with `device-info`; values are `null` when nothing is registered. APNs's includes `voip_device_token`.
 
 ### 6.4 Wake-up notifications
 
@@ -214,7 +225,14 @@ Visible rather than silent: a woken wallet is usually locked (its keys need the 
 - at least `ALMENA_PUSH_MIN_INTERVAL` seconds between two pushes;
 - a wallet that never picks up gets no further push until `ALMENA_QUEUE_TTL` has passed.
 
-Tokens reported invalid are deleted (FCM `UNREGISTERED`, `INVALID_ARGUMENT`; APNs `410`, `BadDeviceToken`, `DeviceTokenNotForTopic`). Other failures are logged, not retried.
+Tokens reported invalid are deleted (FCM `UNREGISTERED`, and `INVALID_ARGUMENT` when it is about the token — its message names the registration token or a field violation names `message.token` —, never one about the payload; APNs `410`, `BadDeviceToken`, `DeviceTokenNotForTopic`). Other failures are logged, not retried; when no device was reached the next queued message may push again after `ALMENA_PUSH_MIN_INTERVAL`, rather than only after a pickup.
+
+**Calls.** A `forward` with `urgency: "call"` (§3.4) rings the recipient's devices instead of waking them; the mediator learns that the message is a call, not who calls nor anything of the offer. Nothing in the push names the caller either.
+
+- FCM: a data-only message — no `notification`, no `android.notification` —, data `{"type": "almena.call"}`, `android.priority` `high`, `android.ttl` `60s`, `collapse_key` `almena.call`. The app shows its own full-screen call screen.
+- APNs, to the `voip_device_token`: `apns-push-type: voip`, `apns-topic` the bundle id plus `.voip`, priority 10, `apns-expiration` now + 60 s, body `{"type": "almena.call"}` (no `aps`). Same provider auth. The app reports the call to CallKit. An APNs device without a VoIP token (an older app) gets the ordinary wake-up instead.
+- 60 s is how long a call offer stands: a phone that comes online later does not ring.
+- Not held back by the wake-up coalescing above — a call rings even if a wake-up already went out — but at most one ring per mediation every `ALMENA_PUSH_RING_INTERVAL` seconds, so an offer sent again does not ring twice. A live session gets neither. Invalid tokens are deleted as for wake-ups.
 
 **Mode.** `ALMENA_PUSH_MODE=direct`: the mediator holds the wallet app's FCM/APNs credentials and calls the services itself. A *push gateway* mode for third-party mediators (they send `{service, token}` to a gateway run by the app publisher) is reserved but not specified yet.
 
@@ -243,23 +261,23 @@ The mediator publishes one [Out-of-Band 2.0][didcomm] invitation that never chan
 
 When a reply cannot go back on the connection (no `return_route`, or `none`), the mediator delivers it only if the request was authcrypted:
 
-1. If the sender is mediated here, the reply is queued for it (live push or wake-up as usual).
+1. If the sender is mediated here — a registered recipient DID, or a mediation DID, registered as a recipient or not — the reply is queued for it (live push or wake-up as usual), unwrapped.
 2. Otherwise it is wrapped for the sender's mediators and sent to its `DIDCommMessaging` service in the background, with the relay retries of §6.7.
 3. A sender with no service, or whose service names this mediator without being registered here, gets nothing.
 
-Replies to the mediator's own administrative messages are never wrapped for the wallet's mediators.
+Replies to the mediator's own administrative messages are never wrapped for the wallet's mediators. Message Pickup answers (`status`, `delivery`) only travel back on the connection: queued, each would add to the queue it describes.
 
 ### 6.7 Federation without a registry
 
 When a `forward`'s `next` is not registered here, the mediator routes the payload as a sender would: resolves `next`, wraps it for the hops of its `DIDCommMessaging` service, and POSTs it to the service URI. `ALMENA_FEDERATION=false` disables this (`404`).
 
 - The first attempt happens before the mediator answers the `forward`; the answer is `202` once routing succeeded, whatever the attempt's outcome.
-- Failed attempts are retried after 5 s, 30 s, 2 min and 10 min, then dropped. Retries survive restarts and are leased (60 s) so that several instances never send the same one. At most 1000 relays wait; beyond that a failed relay is dropped.
+- Failed attempts are retried after 5 s, 30 s, 2 min and 10 min, then dropped. Retries survive restarts and are leased (60 s) so that several instances never send the same one; the due ones are tried at once, each bounded by the outbound timeout (15 s), so a round ends well within its lease. At most 1000 relays wait, 50 for one destination host and 128 MiB in all; beyond that a failed relay is dropped.
 - A route that leads back to this mediator without a registration is `404`, not a loop.
 
 ### 6.8 Outbound request guard
 
-Every outbound URL comes from a DID document, i.e. from strangers. Outbound HTTP (federation, `did:web`) MUST use `https`, MUST NOT target IP-literal hosts, and MUST NOT connect to private, loopback, link-local, CGNAT or documentation addresses — checked at connect time, so DNS rebinding cannot bypass it. `ALMENA_OUTBOUND_ALLOW_INSECURE=true` lifts the guard for local multi-mediator setups only.
+Every outbound URL comes from a DID document, i.e. from strangers. Outbound HTTP (federation, `did:web`) MUST use `https`, MUST NOT target IP-literal hosts, and MUST NOT connect to private, loopback, link-local, CGNAT or documentation addresses — checked at connect time, so DNS rebinding cannot bypass it. A `307` is followed only to a URL that passes the same checks. A fetched DID document or `did:webvh` log weighs at most 1 MiB, and a DID that failed to resolve is not fetched again for 60 s. `ALMENA_OUTBOUND_ALLOW_INSECURE=true` lifts the guard for local multi-mediator setups only.
 
 ### 6.9 TURN credentials
 
@@ -330,7 +348,7 @@ Problem reports follow [DIDComm] §Problem Reports: they open a child thread of 
 
 ### 7.2 WebSocket
 
-`GET /ws` upgrades. One encrypted DIDComm message per frame (text or binary, up to `ALMENA_MAX_MESSAGE_BYTES`), both directions. `return_route` is implied on the socket. Frames count against the same per-IP rate limit as `POST /didcomm`; exceeding it closes the socket with code `1008`.
+`GET /ws` upgrades. One encrypted DIDComm message per frame (text or binary, up to `ALMENA_MAX_MESSAGE_BYTES`), both directions. `return_route` is implied on the socket. Every frame the client sends (text, binary, ping; not the pong to the mediator's ping) counts against the same per-client rate limit as `POST /didcomm`; exceeding it closes the socket with code `1008`. At most 16 sockets per client are open at once (more: `429`). The mediator pings every 30 s and closes a socket it has heard nothing from, not even a pong, for 90 s.
 
 Live mode: the wallet sends an authcrypted `live-delivery-change` with `live_delivery: true` and is answered with `status` (`live_delivery: true`). From then on, each message queued for the mediation is pushed as a `delivery` with one attachment whose `id` is the queue id. Messages queued earlier are fetched with `delivery-request`. Live mode ends with the connection. A mediation is *online* while it has a live session; online mediations get no push.
 
@@ -393,9 +411,10 @@ Limits are operator settings, not protocol: any wallet may request mediation, an
 | `ALMENA_QUEUE_MAX_MESSAGES` | 10 000 per mediation | `507`. |
 | `ALMENA_QUEUE_MAX_BYTES` | 100 MiB per mediation | `507`. |
 | `ALMENA_MAX_RECIPIENT_DIDS` | 100 per mediation | `client_error`. |
-| `ALMENA_MEDIATION_TTL` | 90 days | A mediation with no authenticated mediation, pickup or push message for this long is removed, with its DIDs, queue and devices. |
-| `ALMENA_RATE_LIMIT` | 60 / min / client IP | `429`, or WebSocket close `1008`. |
+| `ALMENA_MEDIATION_TTL` | 90 days | A mediation with no authenticated mediation, pickup or push message for this long is removed, with its DIDs, queue and devices. Asking for TURN credentials does not count. |
+| `ALMENA_RATE_LIMIT` | 60 / min / client | `429`, or WebSocket close `1008`. A client is an IPv4 address or an IPv6 /64. |
 | `ALMENA_PUSH_MIN_INTERVAL` | 60 s | §6.4. |
+| `ALMENA_PUSH_RING_INTERVAL` | 5 s | Least time between two call rings to one mediation (§6.4). |
 | `ALMENA_TURN_TTL` | 1 day | Lifetime of TURN credentials (§6.9). |
 
 The full list is in [.env.example](.env.example).
@@ -404,7 +423,7 @@ The full list is in [.env.example](.env.example).
 
 - **Content.** The mediator stores and forwards opaque envelopes encrypted to wallets. It learns recipient DIDs, sizes and timing, not content or senders of forwarded messages.
 - **Queue ownership.** Authcrypt on every administrative message (§6.1) and possession proofs (§6.2) bind queues to wallets that control the DIDs.
-- **Push.** Payloads carry nothing linkable to a DID, a sender or a message (§6.4). Push providers learn only that a device is being woken.
+- **Push.** Payloads carry nothing linkable to a DID, a sender or a message (§6.4). Push providers learn only that a device is being woken, or rung for a call. The `urgency` header (§3.4) tells every mediator on the route that a message is a call, not from whom.
 - **Calls.** Media is DTLS-SRTP between the two wallets; the TURN server relays it without being able to read it. It sees both wallets' IP addresses and the timing and volume of their calls, as the mediator already sees their messages' — which is why each wallet uses its own mediator's TURN server. TURN is offered over UDP and TCP without TLS: a network observer can see that a wallet uses TURN, but not what it carries.
 - **Metrics.** Aggregate only — no DIDs, nothing per mediation — and served on a separate listener.
 - **Outbound requests.** Guarded against SSRF (§6.8); `links` attachments refused (D8).
@@ -415,7 +434,7 @@ The full list is in [.env.example](.env.example).
 - DIDComm v1 envelopes; DIDComm v2.1 features beyond what §3.3 accepts on read.
 - `forward` rewrapping, `delay_milli`, `links` attachments.
 - A push gateway for third-party mediators (§6.4).
-- TURN over TLS (`turns:`), and wake-ups for incoming calls (a call only rings on a wallet that is online).
+- TURN over TLS (`turns:`).
 - Live delivery across several mediator instances (sessions are per process).
 - Message content protocols, groups, directories, a mediator registry.
 
@@ -452,6 +471,7 @@ Items were either **decided** explicitly or are **proposed** defaults that stand
 | **Metrics on their own listener**, aggregate only | Never exposed through the public proxy; no DIDs. | App. H |
 | **TURN credentials from the mediator**, relay always | Calls never expose a wallet's IP to its contact; the operator who relays is the one the wallet already trusts; no second account. (2026-09-25) | §6.9 |
 | **Fixed Almena PIURIs** (`https://almena.id/protocols/…`) | No DIDComm protocol exists for this; a PIURI is a name compared as text, so it cannot vary per environment. (2026-09-25) | §6.9 |
+| **Calls marked on the `forward`**, rung with VoIP / data pushes | A phone must ring for a call while the wallet is closed; only the sender knows a message is a call, and the mediator learns no more than that. (2026-10-03) | §3.4, §6.4 |
 
 ## Appendix B. Code layout and library
 
@@ -471,8 +491,8 @@ mediator/
 `almena-didcomm` knows nothing about HTTP, storage or mediation, so the wallet can depend on it (as a git dependency) when it needs to encrypt; if that becomes awkward it is extracted into its own project.
 
 - Built on RustCrypto primitives (`x25519-dalek`, `ed25519-dalek`, `p256`, `p384`, `p521`, `k256`, `aes-kw`, `aes-gcm`, `chacha20poly1305`, `aes` + `cbc` + `hmac` + `sha2`). The Concat KDF is a few lines of our own (the `concat-kdf` crate lags behind `sha2`).
-- DID resolution is a trait, so the mediator can add caching and the wallet can plug in its own. `LocalResolver` handles `did:key` and `did:peer`; `StaticResolver` holds fixed documents; `ChainResolver` combines them. `LocalResolver` keeps the `did:peer:4` long-form mapping in memory (bounded); the wallet will need to persist it.
-- `pack_encrypted` wraps the message in `forward`s for the recipient's hops (`PackOptions::forward`, on by default) and returns the URI to POST to (`PackedMessage::service_uri`). `almena_didcomm::route` does the same for a payload the mediator relays.
+- DID resolution is a trait, so the mediator can add caching and the wallet can plug in its own. `LocalResolver` handles `did:key` and `did:peer`; `did::webvh` walks a `did:webvh` log the caller fetched (the mediator's `WebResolver` fetches it, and `did:web` documents); `StaticResolver` holds fixed documents; `ChainResolver` combines them. `LocalResolver` keeps the `did:peer:4` long-form mapping in memory (bounded); the wallet will need to persist it.
+- `pack_encrypted` wraps the message in `forward`s for the recipient's hops (`PackOptions::forward`, on by default) and returns the URI to POST to (`PackedMessage::service_uri`); `PackOptions::urgency` (`Urgency::Call`) marks them for a call offer. `almena_didcomm::route` does the same for a payload the mediator relays, and `route_with` keeps its urgency.
 - `PossessionProof` makes and checks the proofs of §6.2.
 
 ## Appendix C. Mediator keys
@@ -496,10 +516,13 @@ Redis, a service in `compose.yml`, with AOF persistence (`appendonly yes`, `appe
 | `mediation:{M}:msg:{id}` | string with TTL | The message itself |
 | `mediation:{M}:bytes` | counter with TTL | Bytes queued, kept in step by the enqueue, expiry and removal scripts |
 | `rate:{key}:{window}` | counter with TTL | Rate-limit hits (fixed window) |
-| `push:{M}` | hash | Devices: service (`fcm`, `apns`) → `{token, platform}` as JSON |
+| `push:{M}` | hash | Devices: service (`fcm`, `apns`, `apns-voip`) → `{token, platform}` as JSON |
 | `push-sent:{M}` | string with TTL | Time of the last push, until the wallet picks up |
+| `ring:{M}` | string with TTL | Time of the last call ring, for `ALMENA_PUSH_RING_INTERVAL` |
 | `relay:due` | sorted set | Relays waiting for a retry, by when they are due (or leased until) |
 | `relay:items` | hash | Relay id → `{uri, message, retries}` as JSON |
+| `relay:hosts` | hash | Destination host → relays waiting for it |
+| `relay:bytes` | counter | Size of the relays waiting |
 
 Bodies live outside the stream so `status` reads only small entries. Registration and enqueueing are Lua scripts, so they are atomic. Expired entries are trimmed on every read and write (`XTRIM MINID`); bodies expire on their own. Expired mediations are swept hourly. A background worker takes due relays every second and leases them for 60 s.
 
@@ -525,16 +548,20 @@ Settings beyond §11, all `ALMENA_*` environment variables (full list in [.env.e
 | `ALMENA_RECIPIENT_PROOF` | `required` | §6.2. |
 | `ALMENA_FEDERATION` | `true` | §6.7. |
 | `ALMENA_OUTBOUND_ALLOW_INSECURE` | `false` | §6.8. |
-| `ALMENA_CLIENT_IP_HEADER` | — | Behind a proxy: header with the client IP; its **last** value is used. Unset: the TCP peer. |
+| `ALMENA_CLIENT_IP_HEADER` | — | Behind a proxy: header with the client IP; its **last** value is used. Unset, or missing from a request: the TCP peer. |
 | `ALMENA_PUSH_MODE` | `off` | `off` or `direct`. |
 | `ALMENA_FCM_SERVICE_ACCOUNT` | — | Service account key (JSON) of the wallet app's Firebase project. |
-| `ALMENA_APNS_KEY_PATH`, `ALMENA_APNS_KEY_ID`, `ALMENA_APNS_TEAM_ID`, `ALMENA_APNS_TOPIC` | — | APNs `.p8` key, its id, the team id and the app's bundle id; all four or none. |
+| `ALMENA_APNS_KEY_PATH`, `ALMENA_APNS_KEY_ID`, `ALMENA_APNS_TEAM_ID`, `ALMENA_APNS_TOPIC` | — | APNs `.p8` key, its id, the team id and the app's bundle id (VoIP pushes go to `<bundle id>.voip`); all four or none. |
 | `ALMENA_APNS_SANDBOX` | `false` | Push to the APNs sandbox. |
 | `ALMENA_METRICS_ADDR` | — | Metrics listener (App. H); off when unset. |
 | `ALMENA_TURN_URLS`, `ALMENA_TURN_SECRET` | — | TURN URIs given to wallets (comma-separated `turn:`/`turns:`) and the secret shared with the TURN server; both or neither (§6.9). |
 | `ALMENA_TURN_TTL` | `86400` | §6.9. |
 
-The TURN server is coturn, a service of `compose.yml` under the `turn` profile (`COMPOSE_PROFILES=turn`), with `use-auth-secret` and the same secret. Its own settings: `ALMENA_TURN_EXTERNAL_IP` (the address relayed candidates carry: the host's public IP, or its LAN or loopback address in development), `ALMENA_TURN_PORT` (3478, UDP and TCP), `ALMENA_TURN_MIN_PORT`–`ALMENA_TURN_MAX_PORT` (the UDP relay ports, one per call leg) and `ALMENA_TURN_REALM`. It runs alone on its own Compose network at a fixed address (`172.31.254.2`), and refuses to relay into private networks except to that address and its external one (§6.9): two wallets on the same TURN server reach each other through its relay address, and nothing else on the host is reachable through it. Only UDP relays are allocated (`no-tcp-relay`).
+The TURN server is coturn, a service of `compose.yml` under the `turn` profile (`COMPOSE_PROFILES=turn`), with `use-auth-secret` and the same secret. Its own settings: `ALMENA_TURN_EXTERNAL_IP` (the address relayed candidates carry: the host's public IP, or its LAN or loopback address in development), `ALMENA_TURN_PORT` (3478, UDP and TCP), `ALMENA_TURN_MIN_PORT`–`ALMENA_TURN_MAX_PORT` (the UDP relay ports, one per call leg) and `ALMENA_TURN_REALM`. It runs alone on its own Compose network at a fixed address (`172.31.254.2`), and refuses to relay into private networks except to that address and its external one (§6.9): two wallets on the same TURN server reach each other through its relay address, and nothing else on the host is reachable through it. Only UDP relays are allocated (`no-tcp-relay`). Since any mediated wallet gets credentials, what they relay is bounded: `ALMENA_TURN_TOTAL_QUOTA` allocations at once (100) and `ALMENA_TURN_MAX_BPS` bytes per second each (500 000); its admin console is off (`no-cli`).
+
+On `SIGTERM` the mediator stops taking connections, closes its WebSockets (`1001`) and gives requests in flight 20 s to finish before it stops anyway; Compose waits 30 s (`stop_grace_period`) before killing it.
+
+Under Compose the mediator's port is published on loopback only (`ALMENA_MEDIATOR_BIND`): the way in is Caddy, which sets `X-Forwarded-For`; reached directly, a client could write that header itself. Redis has a memory ceiling (`ALMENA_REDIS_MAXMEMORY`, 1 GB) with `noeviction`: at it writes fail and the mediator answers `503`, rather than queued messages disappearing.
 
 ## Appendix H. Metrics
 
@@ -548,7 +575,12 @@ Prometheus text format on `ALMENA_METRICS_ADDR`, hand-written counters. Aggregat
 | `almena_forwards_total` | `result` (`queued`, `relayed`, `relay_scheduled`, `relay_dropped`, `refused`) |
 | `almena_relay_retries_total` | `result` (`delivered`, `rescheduled`, `abandoned`) |
 | `almena_pushes_total` | `service` (`fcm`, `apns`), `result` (`delivered`, `invalid_token`, `failed`) |
-| `almena_live_sessions` (gauge) | — |
+| `almena_rings_total` | `service` (`fcm`, `apns`, `apns-voip`), `result` (as above); call pushes, `apns` being the wake-up an iPhone without a VoIP token gets |
+| `almena_didcomm_message_seconds` (histogram) | — (time from envelope to answer) |
+| `almena_websocket_connections` (gauge) | — |
+| `almena_live_sessions` (gauge) | — (WebSockets in live mode) |
+| `almena_messages_acknowledged_total` | — (with `almena_forwards_total{result="queued"}`, how the queues grow) |
+| `almena_store_errors_total` | — |
 | `almena_mediations_granted_total`, `almena_mediations_removed_total` | — |
 | `almena_turn_credentials_total` | — |
 
@@ -559,7 +591,7 @@ Prometheus text format on `ALMENA_METRICS_ADDR`, hand-written counters. Aggregat
 3. ✅ **Mediation** — Coordinate Mediation 3.0, `forward`, Message Pickup 3.0 (polling), limits.
 4. ✅ **Live and network** — WebSocket and live delivery, Out-of-Band invitations, federation.
 5. ✅ **Push** — FCM and APNs protocols, token storage, coalesced wake-ups, direct mode. The push gateway (App. F) waits for third-party mediators.
-6. ✅ **Calls** — TURN credentials (§6.9) and coturn in `compose.yml`. Wake-ups for incoming calls come later.
+6. ✅ **Calls** — TURN credentials (§6.9) and coturn in `compose.yml`; calls marked on the `forward` ring the phone (§6.4).
 
 Each phase ends with `task check` green and this document updated.
 
@@ -568,6 +600,7 @@ Each phase ends with `task check` green and this document updated.
 [didkey]: https://w3c-ccg.github.io/did-method-key/
 [didpeer]: https://identity.foundation/peer-did-method-spec/
 [didweb]: https://w3c-ccg.github.io/did-method-web/
+[didwebvh]: https://identity.foundation/didwebvh/v1.0/
 [rfc2119]: https://www.rfc-editor.org/rfc/rfc2119
 [rfc8174]: https://www.rfc-editor.org/rfc/rfc8174
 [rfc7515]: https://www.rfc-editor.org/rfc/rfc7515

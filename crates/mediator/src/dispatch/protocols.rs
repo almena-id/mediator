@@ -49,7 +49,8 @@ pub const TURN_CREDENTIALS: &str = "https://almena.id/protocols/turn/1.0/credent
 pub fn push_protocol(service: Service) -> &'static str {
     match service {
         Service::Fcm => PUSH_FCM,
-        Service::Apns => PUSH_APNS,
+        // VoIP tokens are registered with the APNs protocol (SPEC.md §6.3).
+        Service::Apns | Service::ApnsVoip => PUSH_APNS,
     }
 }
 

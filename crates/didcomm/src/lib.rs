@@ -39,7 +39,7 @@ pub use error::{Error, Result};
 pub use from_prior::FromPrior;
 pub use jwk::Jwk;
 pub use message::{Attachment, Message};
-pub use pack::{FORWARD, PackOptions, PackedMessage, Routed, route};
+pub use pack::{FORWARD, PackOptions, PackedMessage, Routed, URGENCY, Urgency, route, route_with};
 pub use possession::PossessionProof;
 pub use secrets::{InMemorySecrets, SecretsResolver};
 pub use unpack::{UnpackMetadata, unpack};

@@ -3,7 +3,7 @@
 use almena_didcomm::crypto::jwe::Jwe;
 use almena_didcomm::did::did_of;
 use almena_didcomm::message::now;
-use almena_didcomm::{Message, PossessionProof, b64};
+use almena_didcomm::{Message, PossessionProof, Urgency, b64};
 use serde_json::{Value, json};
 
 use super::protocols::{self, Problem};
@@ -37,6 +37,20 @@ pub async fn handle(
             let Some(updates) = message.body.get("updates").and_then(Value::as_array) else {
                 return Ok(Handled::Problem(Problem::InvalidBody));
             };
+            // Each `add` of another DID may cost a DID resolution: no more of
+            // them than a mediation may hold DIDs, and none verified past the
+            // limit.
+            let max = mediator.limits().max_recipient_dids;
+            let proved = updates
+                .iter()
+                .filter(|u| u.get("action").and_then(Value::as_str) == Some("add"))
+                .filter_map(|u| u.get("recipient_did").and_then(Value::as_str))
+                .filter(|did| is_did(did) && *did != requester)
+                .count();
+            if proved > max {
+                return Ok(Handled::Problem(Problem::InvalidBody));
+            }
+            let mut held = store.recipients(requester).await?;
             let mut updated = Vec::with_capacity(updates.len());
             for update in updates {
                 let did = update
@@ -47,7 +61,8 @@ pub async fn handle(
                     .get("action")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let result = if !is_did(did) {
+                let full = action == "add" && !held.iter().any(|r| r == did) && held.len() >= max;
+                let result = if !is_did(did) || full {
                     "client_error"
                 } else if action == "add"
                     && let Err(reason) = check_proof(mediator, requester, did, update).await
@@ -56,18 +71,21 @@ pub async fn handle(
                     "client_error"
                 } else {
                     match action {
-                        "add" => match store
-                            .add_recipient(requester, did, mediator.limits().max_recipient_dids)
-                            .await?
-                        {
-                            AddRecipient::Added => "success",
+                        "add" => match store.add_recipient(requester, did, max).await? {
+                            AddRecipient::Added => {
+                                held.push(did.to_owned());
+                                "success"
+                            }
                             AddRecipient::AlreadyYours => "no_change",
                             AddRecipient::TakenByOther | AddRecipient::LimitReached => {
                                 "client_error"
                             }
                         },
                         "remove" => match store.remove_recipient(requester, did).await? {
-                            RemoveRecipient::Removed => "success",
+                            RemoveRecipient::Removed => {
+                                held.retain(|r| r != did);
+                                "success"
+                            }
                             RemoveRecipient::NotRegistered => "no_change",
                             RemoveRecipient::NotYours => "client_error",
                         },
@@ -171,6 +189,10 @@ fn is_did(value: &str) -> bool {
 /// relays it to `next`'s own mediator otherwise (see `relay`). Forward
 /// senders are anonymous by design, so failures are reported at the HTTP
 /// level (see `ReceiveError`), never as DIDComm problem reports.
+///
+/// A `forward` marked as a call (`Urgency::Call`) rings the recipient's
+/// devices rather than waking them, and a relayed one stays marked, so the
+/// mediator that finally queues it knows too.
 pub async fn forward(mediator: &Mediator, message: &Message) -> Result<(), ReceiveError> {
     let next = message
         .body
@@ -206,17 +228,19 @@ pub async fn forward(mediator: &Mediator, message: &Message) -> Result<(), Recei
         payloads.push(payload);
     }
 
+    let urgency = Urgency::of(message);
     let recipient = did_of(next);
     let Some(mediation) = mediator.store().mediation_of(recipient).await? else {
         // Not ours: pass it on to the mediator that mediates `next`, if allowed.
-        return super::relay::relay(mediator, next, payloads).await;
+        return super::relay::relay(mediator, next, payloads, urgency).await;
     };
-    for payload in payloads {
-        queue(mediator, &mediation, recipient, payload).await?;
-    }
-    tracing::debug!(%recipient, count = attachments.len(), "forward queued");
+    queue_all(mediator, &mediation, recipient, payloads).await?;
+    tracing::debug!(%recipient, count = attachments.len(), ?urgency, "forward queued");
     METRICS.forward(Forward::Queued, attachments.len() as u64);
-    mediator.wake(&mediation);
+    match urgency {
+        Urgency::Normal => mediator.wake(&mediation),
+        Urgency::Call => mediator.ring(&mediation),
+    }
     Ok(())
 }
 
@@ -228,27 +252,40 @@ pub async fn queue(
     recipient: &str,
     payload: String,
 ) -> Result<(), ReceiveError> {
+    queue_all(mediator, mediation, recipient, vec![payload]).await
+}
+
+/// [`queue`] for several messages: all of them, or none if they do not all
+/// fit, so that the sender's retry duplicates nothing.
+async fn queue_all(
+    mediator: &Mediator,
+    mediation: &str,
+    recipient: &str,
+    payloads: Vec<String>,
+) -> Result<(), ReceiveError> {
     let received = now();
-    let id = mediator
+    let ids = mediator
         .store()
-        .enqueue(
+        .enqueue_all(
             mediation,
             recipient,
-            &payload,
+            &payloads,
             received,
             mediator.limits().queue,
         )
         .await?
         .ok_or(ReceiveError::QueueFull)?;
-    mediator.live().notify(
-        mediation,
-        &Queued {
-            id,
-            recipient: recipient.to_owned(),
-            received,
-            message: payload,
-        },
-    );
+    for (id, message) in ids.into_iter().zip(payloads) {
+        mediator.live().notify(
+            mediation,
+            &Queued {
+                id,
+                recipient: recipient.to_owned(),
+                received,
+                message,
+            },
+        );
+    }
     Ok(())
 }
 

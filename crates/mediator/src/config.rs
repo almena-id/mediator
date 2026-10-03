@@ -94,6 +94,9 @@ pub struct PushConfig {
     /// Least seconds between two pushes to one mediation
     /// (`ALMENA_PUSH_MIN_INTERVAL`).
     pub min_interval_secs: u64,
+    /// Least seconds between two call rings to one mediation
+    /// (`ALMENA_PUSH_RING_INTERVAL`).
+    pub ring_interval_secs: u64,
     /// Google service account key file of the wallet app's Firebase project
     /// (`ALMENA_FCM_SERVICE_ACCOUNT`).
     pub fcm_service_account: Option<PathBuf>,
@@ -113,6 +116,7 @@ impl Default for PushConfig {
         Self {
             mode: PushMode::Off,
             min_interval_secs: 60,
+            ring_interval_secs: 5,
             fcm_service_account: None,
             apns: None,
         }
@@ -302,6 +306,12 @@ fn push(lookup: &impl Fn(&str) -> Option<String>, default: PushConfig) -> Result
                 .with_context(|| format!("invalid ALMENA_PUSH_MIN_INTERVAL: {v}"))?,
             None => default.min_interval_secs,
         },
+        ring_interval_secs: match lookup("ALMENA_PUSH_RING_INTERVAL") {
+            Some(v) => v
+                .parse()
+                .with_context(|| format!("invalid ALMENA_PUSH_RING_INTERVAL: {v}"))?,
+            None => default.ring_interval_secs,
+        },
         fcm_service_account: set("ALMENA_FCM_SERVICE_ACCOUNT").map(PathBuf::from),
         apns,
     };
@@ -462,6 +472,7 @@ mod tests {
         let config = Config::from_lookup(lookup(&[
             ("ALMENA_PUSH_MODE", "direct"),
             ("ALMENA_PUSH_MIN_INTERVAL", "30"),
+            ("ALMENA_PUSH_RING_INTERVAL", "10"),
             ("ALMENA_FCM_SERVICE_ACCOUNT", "/secrets/fcm.json"),
             ("ALMENA_APNS_KEY_PATH", "/secrets/apns.p8"),
             ("ALMENA_APNS_KEY_ID", "KEY1234567"),
@@ -472,6 +483,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.push.mode, PushMode::Direct);
         assert_eq!(config.push.min_interval_secs, 30);
+        assert_eq!(config.push.ring_interval_secs, 10);
         assert_eq!(
             config.push.fcm_service_account,
             Some(PathBuf::from("/secrets/fcm.json"))

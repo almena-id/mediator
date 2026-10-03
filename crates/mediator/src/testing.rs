@@ -20,6 +20,7 @@ pub const LIMITS: Limits = Limits {
     },
     max_recipient_dids: 3,
     push_min_interval_secs: 0,
+    push_ring_interval_secs: 0,
     // Off so tests can register any DID; the proof has tests of its own.
     recipient_proof: false,
     mediation_ttl_secs: 90 * 24 * 3600,
@@ -146,11 +147,18 @@ impl Wallet {
     }
 }
 
-/// A [`Pusher`](crate::push::Pusher) that records the wake-ups it is asked
-/// for. Tokens starting with `dead` are reported invalid.
+/// What a [`RecordingPusher`] was asked to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pushed {
+    Wake,
+    Ring,
+}
+
+/// A [`Pusher`](crate::push::Pusher) that records the wake-ups and rings it
+/// is asked for. Tokens starting with `dead` are reported invalid.
 pub struct RecordingPusher {
     services: Vec<crate::push::Service>,
-    sent: tokio::sync::mpsc::UnboundedSender<(crate::push::Service, String)>,
+    sent: tokio::sync::mpsc::UnboundedSender<(Pushed, crate::push::Service, String)>,
 }
 
 impl RecordingPusher {
@@ -158,7 +166,7 @@ impl RecordingPusher {
         services: &[crate::push::Service],
     ) -> (
         Arc<Self>,
-        tokio::sync::mpsc::UnboundedReceiver<(crate::push::Service, String)>,
+        tokio::sync::mpsc::UnboundedReceiver<(Pushed, crate::push::Service, String)>,
     ) {
         let (sent, received) = tokio::sync::mpsc::unbounded_channel();
         (
@@ -168,6 +176,20 @@ impl RecordingPusher {
             }),
             received,
         )
+    }
+
+    fn record(
+        &self,
+        pushed: Pushed,
+        service: crate::push::Service,
+        token: &str,
+    ) -> crate::push::Sent {
+        let _ = self.sent.send((pushed, service, token.to_owned()));
+        if token.starts_with("dead") {
+            crate::push::Sent::InvalidToken
+        } else {
+            crate::push::Sent::Delivered
+        }
     }
 }
 
@@ -182,12 +204,15 @@ impl crate::push::Pusher for RecordingPusher {
         service: crate::push::Service,
         token: &str,
     ) -> anyhow::Result<crate::push::Sent> {
-        let _ = self.sent.send((service, token.to_owned()));
-        Ok(if token.starts_with("dead") {
-            crate::push::Sent::InvalidToken
-        } else {
-            crate::push::Sent::Delivered
-        })
+        Ok(self.record(Pushed::Wake, service, token))
+    }
+
+    async fn ring(
+        &self,
+        service: crate::push::Service,
+        token: &str,
+    ) -> anyhow::Result<crate::push::Sent> {
+        Ok(self.record(Pushed::Ring, service, token))
     }
 }
 
@@ -241,6 +266,10 @@ impl crate::transport::Transport for InProcess {
         let (path, mediator) = self.find(url)?;
         anyhow::ensure!(path == "/.well-known/did.json", "not found: {url}");
         Ok(mediator.identity().document.to_json())
+    }
+
+    async fn get_text(&self, url: &str) -> anyhow::Result<String> {
+        anyhow::bail!("not found: {url}")
     }
 
     async fn post_didcomm(&self, url: &str, message: &str) -> anyhow::Result<()> {
