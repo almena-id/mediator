@@ -27,13 +27,12 @@ tasks:
       - docker compose up --detach --wait redis
 
   turn:
-    desc: Start the TURN relay (coturn) in Docker, for task dev and dev:memory
+    desc: Start the TURN relay (coturn) in Docker, for calls (with task dev or dev:memory)
     cmds:
       - docker compose --profile turn up --detach coturn
 
   dev:
-    desc: Run the mediator locally with readable debug logs (starts Redis in Docker)
-    deps: [redis]
+    desc: Run the mediator locally with readable debug logs; Redis must be running (task redis)
     env:
       ALMENA_LOG_FORMAT: pretty
       ALMENA_REDIS_URL: redis://127.0.0.1:{{.ALMENA_REDIS_PORT | default "6379"}}
@@ -66,8 +65,7 @@ tasks:
       - cargo test --locked {{.CLI_ARGS}}
 
   test:redis:
-    desc: Run the test suite including the Redis store tests (starts Redis in Docker)
-    deps: [redis]
+    desc: Run the test suite including the Redis store tests; Redis must be running (task redis)
     env:
       ALMENA_TEST_REDIS_URL: redis://127.0.0.1:{{.ALMENA_REDIS_PORT | default "6379"}}
     cmds:

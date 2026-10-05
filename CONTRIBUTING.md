@@ -12,7 +12,8 @@ Redis and the full stack).
 ```bash
 task init        # creates .env from .env.example
 task dev:memory  # runs the mediator without Docker, everything in memory
-task dev         # runs it against Redis in Docker
+task redis       # starts Redis in Docker
+task dev         # runs it against that Redis
 task up          # the full stack in Docker, behind Caddy
 task --list      # everything else
 ```
