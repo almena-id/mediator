@@ -158,7 +158,7 @@ A profile of [CoordMed] and [Pickup]:
 
 - Every Coordinate Mediation, Message Pickup and push-protocol message MUST be **authcrypted**. Anything else gets `e.m.trust.unauthenticated`.
 - A mediation is keyed by the authenticated `from` (the *mediation DID*). Nobody can read or acknowledge another wallet's queue by claiming its DID.
-- `mediate-request` is always granted and idempotent; `mediate-deny` is never sent. `mediate-grant` carries `routing_did: [<mediator DID>]`; the wallet puts that DID as the `uri` of its own `DIDCommMessaging` service.
+- `mediate-request` is granted while the mediator has room, and is idempotent: a mediation it already holds is always granted again. A new one is answered with `mediate-deny` (empty body) when the mediator holds `ALMENA_MAX_MEDIATIONS` or its store is at its high water (§11). `mediate-grant` carries `routing_did: [<mediator DID>]`; the wallet puts that DID as the `uri` of its own `DIDCommMessaging` service.
 - A recipient DID belongs to the **first** mediation that registers it; later `add`s from other mediations get `client_error`. DID URLs, non-DIDs, unknown actions and going over the per-mediation limit also get `client_error`. Removing a DID keeps its queued messages until picked up or expired.
 - `recipient-query` returns all DIDs sorted; with `paginate`, a page plus `pagination {count, offset, remaining}`.
 - One queue per **mediation**, not per recipient DID, so queue ids are unique across a wallet's DIDs; `recipient_did` filters within it and MUST be one of the mediation's (`e.m.msg.unknown-recipient`).
@@ -344,11 +344,11 @@ Problem reports follow [DIDComm] §Problem Reports: they open a child thread of 
 | `415` | Any other `Content-Type`. |
 | `429` | Over the per-IP rate limit; with `Retry-After`. |
 | `503` | Storage unavailable. |
-| `507` | The recipient's queue is full (messages or bytes). |
+| `507` | The recipient's queue is full (messages or bytes), or the mediator's store is at its high water (§11). |
 
 ### 7.2 WebSocket
 
-`GET /ws` upgrades. One encrypted DIDComm message per frame (text or binary, up to `ALMENA_MAX_MESSAGE_BYTES`), both directions. `return_route` is implied on the socket. Every frame the client sends (text, binary, ping; not the pong to the mediator's ping) counts against the same per-client rate limit as `POST /didcomm`; exceeding it closes the socket with code `1008`. At most 16 sockets per client are open at once (more: `429`). The mediator pings every 30 s and closes a socket it has heard nothing from, not even a pong, for 90 s.
+`GET /ws` upgrades. One encrypted DIDComm message per frame (text or binary, up to `ALMENA_MAX_MESSAGE_BYTES`), both directions. `return_route` is implied on the socket. Every frame the client sends (text, binary, ping; not the pong to the mediator's ping) counts against the same per-client rate limit as `POST /didcomm`; exceeding it closes the socket with code `1008`. At most 16 sockets per client are open at once (more: `429`), and `ALMENA_MAX_SOCKETS` in all (more: `503`, with `Retry-After`). The mediator pings every 30 s and closes a socket it has heard nothing from, not even a pong, for 90 s.
 
 Live mode: the wallet sends an authcrypted `live-delivery-change` with `live_delivery: true` and is answered with `status` (`live_delivery: true`). From then on, each message queued for the mediation is pushed as a `delivery` with one attachment whose `id` is the queue id. Messages queued earlier are fetched with `delivery-request`. Live mode ends with the connection. A mediation is *online* while it has a live session; online mediations get no push.
 
@@ -360,7 +360,7 @@ Live mode: the wallet sends an authcrypted `live-delivery-change` with `live_del
 | `GET /.well-known/security.txt` | Where to report a vulnerability (RFC 9116). |
 | `GET /oob/invitation` | The invitation (§6.5) and its URL form, as JSON. |
 | `GET /oob` | Human-readable invitation page. |
-| `GET /health` | Status, version and DID; `503` while storage is down. |
+| `GET /health` | Status, version and DID; `503` while storage is down. `capacity` is `full` while new mediations are denied (§11). |
 | `GET /` | Home page: status, DID, invitation QR and `almena://` link. |
 | `GET /openapi.json`, `GET /docs` | API reference. |
 
@@ -402,15 +402,20 @@ TLS is terminated by a reverse proxy; the mediator speaks plain HTTP.
 
 ## 11. Limits
 
-Limits are operator settings, not protocol: any wallet may request mediation, and access can later be narrowed (invitation-only, allowlist) without changing the protocol. Defaults:
+Limits are operator settings, not protocol: any wallet may request mediation, and access can later be narrowed (invitation-only, allowlist) without changing the protocol.
+
+A mediator's physical resources are bounded, so besides the limits per mediation and per client it has ceilings in all. The per-mediation quotas overcommit the store on purpose; the store's high water is what keeps one wallet's queue from filling it for everyone. At a ceiling, what the mediator already holds keeps working (pickup, acknowledgement, recipient updates, a repeated `mediate-request`) and only what would add load is refused: new mediations (`mediate-deny`), new messages (`507`), new WebSockets (`503`). Defaults:
 
 | Setting | Default | Effect |
 |---|---|---|
 | `ALMENA_MAX_MESSAGE_BYTES` | 1 MiB | `413`; disclosed as `max_receive_bytes`. |
 | `ALMENA_QUEUE_TTL` | 30 days | Undelivered messages dropped. |
-| `ALMENA_QUEUE_MAX_MESSAGES` | 10 000 per mediation | `507`. |
-| `ALMENA_QUEUE_MAX_BYTES` | 100 MiB per mediation | `507`. |
+| `ALMENA_QUEUE_MAX_MESSAGES` | 1 000 per mediation | `507`. |
+| `ALMENA_QUEUE_MAX_BYTES` | 10 MiB per mediation | `507`. |
 | `ALMENA_MAX_RECIPIENT_DIDS` | 100 per mediation | `client_error`. |
+| `ALMENA_MAX_MEDIATIONS` | 10 000 in all; 0 = no limit | A new mediation gets `mediate-deny`. |
+| `ALMENA_STORE_HIGH_WATER` | 90 % of Redis `maxmemory` | Sampled every 5 s. At it a new mediation gets `mediate-deny` and a new message `507`. Without `maxmemory` there is nothing to measure against and it is off. |
+| `ALMENA_MAX_SOCKETS` | 5 000 WebSockets in all | `503` with `Retry-After`. |
 | `ALMENA_MEDIATION_TTL` | 90 days | A mediation with no authenticated mediation, pickup or push message for this long is removed, with its DIDs, queue and devices. Asking for TURN credentials does not count. |
 | `ALMENA_RATE_LIMIT` | 60 / min / client | `429`, or WebSocket close `1008`. A client is an IPv4 address or an IPv6 /64. |
 | `ALMENA_PUSH_MIN_INTERVAL` | 60 s | §6.4. |
@@ -457,6 +462,7 @@ Items were either **decided** explicitly or are **proposed** defaults that stand
 | **Authcrypt** on mediation, pickup and push | Queues keyed by an authenticated DID; nobody claims another's. | §6.1 |
 | **Recipient possession proof** | Coordinate Mediation lets anyone register someone else's DID first. | §6.2 |
 | **Open with limits** | Any wallet may mediate; access can be narrowed later without protocol changes. | §11 |
+| **Ceilings in all**, refusing only what is new | Resources are physical; past a ceiling the wallets already served keep working, and pickups free the room. (2026-10-13) | §6.1, §11 |
 | **`links` attachments refused** | SSRF and downloading on strangers' behalf; no tested client uses them. | D8 |
 | **Live messages stay queued** until acknowledged | Mobile connections drop mid-delivery. | D7 |
 | **Visible, content-free pushes** | Locked wallets cannot pick up in the background; iOS throttles silent pushes. (2026-09-24) | §6.4 |
@@ -561,7 +567,7 @@ The TURN server is coturn, a service of `compose.yml` under the `turn` profile (
 
 On `SIGTERM` the mediator stops taking connections, closes its WebSockets (`1001`) and gives requests in flight 20 s to finish before it stops anyway; Compose waits 30 s (`stop_grace_period`) before killing it.
 
-Under Compose the mediator's port is published on loopback only (`ALMENA_MEDIATOR_BIND`): the way in is Caddy, which sets `X-Forwarded-For`; reached directly, a client could write that header itself. Redis has a memory ceiling (`ALMENA_REDIS_MAXMEMORY`, 1 GB) with `noeviction`: at it writes fail and the mediator answers `503`, rather than queued messages disappearing.
+Under Compose the mediator's port is published on loopback only (`ALMENA_MEDIATOR_BIND`): the way in is Caddy, which sets `X-Forwarded-For`; reached directly, a client could write that header itself. Redis has a memory ceiling (`ALMENA_REDIS_MAXMEMORY`, 1 GB) with `noeviction`: at it writes fail and the mediator answers `503`, rather than queued messages disappearing. The mediator samples Redis's memory (`INFO memory`) and stops taking new mediations and messages at `ALMENA_STORE_HIGH_WATER` of that ceiling, so it is not reached in normal operation.
 
 ## Appendix H. Metrics
 
@@ -583,6 +589,10 @@ Prometheus text format on `ALMENA_METRICS_ADDR`, hand-written counters. Aggregat
 | `almena_store_errors_total` | — |
 | `almena_mediations_granted_total`, `almena_mediations_removed_total` | — |
 | `almena_turn_credentials_total` | — |
+| `almena_capacity_refused_total` | `reason` (`mediations`, `storage`, `websockets`): what was refused at a ceiling (§11) |
+| `almena_mediations` (gauge) | — (mediations held, sampled every 5 s) |
+| `almena_store_memory_bytes`, `almena_store_memory_max_bytes` (gauges) | — (Redis `used_memory` and `maxmemory`; 0 without a ceiling) |
+| `almena_store_full` (gauge) | — (1 while at `ALMENA_STORE_HIGH_WATER`) |
 
 ## Appendix I. Phases
 

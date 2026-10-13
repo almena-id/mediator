@@ -24,6 +24,7 @@ Cargo workspace:
   - `transport.rs`: outbound HTTPS with the SSRF guard, and the `did:web` / `did:webvh` resolver. `oob.rs`: the Out-of-Band invitation.
   - `routes` is the axum router: HTTP and WebSocket endpoints, rate limit, HTTP status mapping.
   - `home.rs`: the page at `/` (the status, version and DID `/health` also gives, the invitation QR and its `almena://` link); the icon (`crates/mediator/assets/icon.png`, compiled in) is the favicon. Its `layout` wraps every browser page (also `/oob`) in the header and footer of Almena's portals (catalog, registry, status) and their typefaces: Chakra Petch (brand, headings), Inter (text), JetBrains Mono (values), compiled in from `crates/mediator/assets/fonts` (SIL OFL, licences beside them) and served at `/fonts/{name}`, so a page never calls a third party.
+  - `capacity.rs`: the ceilings in all (SPEC.md §11): samples Redis's memory against its `maxmemory` every 5 s; past `ALMENA_STORE_HIGH_WATER` new mediations are denied and new messages refused. The mediation ceiling is checked in the store when granting, the WebSocket one in `routes`.
   - `metrics.rs`: Prometheus counters, served by their own listener (`ALMENA_METRICS_ADDR`), not by the router.
   - `src/main.rs`: logging, start-up, graceful shutdown, `healthcheck` subcommand. `testing.rs` has a test mediator and wallets.
   - `examples/smoke.rs`: end-to-end client against a running mediator (`task smoke`).

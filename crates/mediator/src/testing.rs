@@ -19,6 +19,7 @@ pub const LIMITS: Limits = Limits {
         max_bytes: 1024 * 1024,
     },
     max_recipient_dids: 3,
+    max_mediations: 0,
     push_min_interval_secs: 0,
     push_ring_interval_secs: 0,
     // Off so tests can register any DID; the proof has tests of its own.

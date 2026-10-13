@@ -35,7 +35,7 @@ use redis::streams::StreamRangeReply;
 
 use super::{
     AddRecipient, PendingRelay, QueueLimits, QueueSummary, Queued, RelayLimits, RemoveRecipient,
-    Store, id_millis, is_queue_id,
+    Store, StoreMemory, id_millis, is_queue_id,
 };
 use crate::push::{Device, Service};
 
@@ -156,6 +156,18 @@ return 0
 ";
 
 const SEEN: &str = "mediations:seen";
+
+/// KEYS[1] mediation, KEYS[2] seen set; ARGV: mediation, now, max (0: no
+/// limit). Every mediation is in the seen set, so it counts them.
+const GRANT: &str = r"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  local max = tonumber(ARGV[3])
+  if max > 0 and redis.call('ZCARD', KEYS[2]) >= max then return 0 end
+  redis.call('SET', KEYS[1], ARGV[2])
+end
+redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+return 1
+";
 
 /// KEYS[1] mediation, KEYS[2] seen set; ARGV: mediation, now.
 const TOUCH: &str = r"
@@ -355,19 +367,38 @@ impl Store for RedisStore {
         "redis"
     }
 
-    async fn grant_mediation(&self, mediation: &str, now: u64) -> Result<()> {
-        let _: () = redis::pipe()
-            .atomic()
-            .cmd("SET")
-            .arg(mediation_key(mediation))
+    async fn grant_mediation(&self, mediation: &str, now: u64, max: u64) -> Result<bool> {
+        let granted: i64 = redis::Script::new(GRANT)
+            .key(mediation_key(mediation))
+            .key(SEEN)
+            .arg(mediation)
             .arg(now)
-            .arg("NX")
-            .ignore()
-            .zadd(SEEN, mediation, now)
-            .ignore()
+            .arg(max)
+            .invoke_async(&mut self.conn())
+            .await?;
+        Ok(granted == 1)
+    }
+
+    async fn mediation_count(&self) -> Result<u64> {
+        Ok(self.conn().zcard(SEEN).await?)
+    }
+
+    /// `used_memory` against `maxmemory` from `INFO memory`; no `maxmemory`
+    /// (0) is no ceiling.
+    async fn memory(&self) -> Result<Option<StoreMemory>> {
+        let info: String = redis::cmd("INFO")
+            .arg("memory")
             .query_async(&mut self.conn())
             .await?;
-        Ok(())
+        let field = |name: &str| {
+            info.lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        };
+        let (Some(used), Some(max)) = (field("used_memory"), field("maxmemory")) else {
+            bail!("INFO memory without used_memory or maxmemory");
+        };
+        Ok((max > 0).then_some(StoreMemory { used, max }))
     }
 
     async fn touch_mediation(&self, mediation: &str, now: u64) -> Result<()> {

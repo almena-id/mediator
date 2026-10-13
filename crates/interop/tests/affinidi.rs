@@ -275,6 +275,7 @@ const LIMITS: Limits = Limits {
         max_bytes: 1024 * 1024,
     },
     max_recipient_dids: 3,
+    max_mediations: 0,
     push_min_interval_secs: 60,
     push_ring_interval_secs: 5,
     recipient_proof: true,

@@ -11,6 +11,7 @@ Needs Rust, [Task](https://taskfile.dev) and Docker.
 ```bash
 task init   # .env from .env.example
 task up     # mediator + Redis + Caddy (HTTPS) in Docker
+task up:no-caddy  # the same without Caddy, behind ../develop's
 ```
 
 It answers at `https://$ALMENA_DOMAIN` (`mediator.almena.id` in `.env.example`; the Caddy site, public URL and TURN URIs all follow it) and at `http://localhost:8080` (loopback only: from elsewhere, through Caddy). Point the name at this machine (in `/etc/hosts` for development); the Let's Encrypt certificate needs the domain's zone in Cloudflare and `CLOUDFLARE_API_TOKEN` (Zone / DNS / Edit) in `.env`. Without Docker, `task dev:memory` runs it in-process with everything in memory.
@@ -35,6 +36,7 @@ All settings are `ALMENA_*` environment variables; [.env.example](.env.example) 
 | `ALMENA_PUSH_RING_INTERVAL` | `5` | Least seconds between two call rings to one wallet |
 | `ALMENA_TURN_URLS` / `ALMENA_TURN_SECRET` | — | TURN relay for calls: URIs given to wallets and the secret shared with coturn (`task init` generates it; coturn runs under the `turn` Compose profile) |
 | `ALMENA_METRICS_ADDR` | — | Prometheus metrics on their own address |
+| `ALMENA_MAX_MEDIATIONS` / `ALMENA_STORE_HIGH_WATER` / `ALMENA_MAX_SOCKETS` | `10000` / `90` / `5000` | Ceilings in all: mediations held, per cent of Redis `maxmemory`, WebSockets open; past them only what is new is refused (SPEC.md §11) |
 
 Keep `keys.json` (the `mediator-data` volume) private and backed up: it is the mediator's identity.
 
@@ -48,7 +50,7 @@ Keep `keys.json` (the `mediator-data` volume) private and backed up: it is the m
 | `GET /.well-known/did.json` | The mediator's DID document |
 | `GET /.well-known/security.txt` | Where to report a vulnerability ([RFC 9116](https://www.rfc-editor.org/rfc/rfc9116)): this repository's private advisories; `Expires` stays 180 days ahead |
 | `GET /oob/invitation`, `GET /oob` | Out-of-Band mediation invitation (JSON, and a page for its QR URL) |
-| `GET /health` | Health, `503` while storage is down |
+| `GET /health` | Health, `503` while storage is down; `capacity: full` while new mediations are denied |
 | `GET /docs`, `GET /openapi.json` | API reference, generated from the code |
 
 ## Development

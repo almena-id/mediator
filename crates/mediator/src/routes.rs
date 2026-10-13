@@ -52,7 +52,7 @@ pub struct AppState {
     pub client_ip_header: Option<HeaderName>,
     /// The mediator's public origin (`ALMENA_PUBLIC_URL`).
     pub public_url: String,
-    /// Open WebSockets per client (see [`client_key`]).
+    /// Open WebSockets, per client (see [`client_key`]) and in all.
     pub sockets: Arc<Sockets>,
     /// Turns `true` when the mediator is shutting down: open WebSockets are
     /// closed (`1001`, going away) so that they do not hold the shutdown up.
@@ -66,40 +66,82 @@ pub const MAX_SOCKETS_PER_CLIENT: usize = 16;
 const SOCKET_PING: Duration = Duration::from_secs(30);
 const SOCKET_IDLE: Duration = Duration::from_secs(90);
 
-/// Open WebSockets by client.
+/// Open WebSockets, by client and in all.
+pub struct Sockets {
+    open: Mutex<OpenSockets>,
+    /// At most this many in all (`ALMENA_MAX_SOCKETS`).
+    max: usize,
+}
+
 #[derive(Default)]
-pub struct Sockets(Mutex<HashMap<IpAddr, usize>>);
+struct OpenSockets {
+    by_client: HashMap<IpAddr, usize>,
+    total: usize,
+}
+
+/// Why a WebSocket was not opened.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketRefused {
+    /// The client has [`MAX_SOCKETS_PER_CLIENT`] open.
+    Client,
+    /// The mediator has as many open as it takes.
+    Full,
+}
 
 impl Sockets {
-    /// Counts one more socket for `client`, unless it already has
-    /// [`MAX_SOCKETS_PER_CLIENT`]; the guard counts it out when dropped.
-    fn open(self: &Arc<Self>, client: Option<IpAddr>) -> Option<SocketGuard> {
-        let Some(client) = client else {
-            return Some(SocketGuard(None));
-        };
-        let mut open = self.0.lock().ok()?;
-        let count = open.entry(client).or_default();
-        if *count >= MAX_SOCKETS_PER_CLIENT {
-            return None;
+    pub fn new(max: usize) -> Self {
+        Self {
+            open: Mutex::default(),
+            max,
         }
-        *count += 1;
-        Some(SocketGuard(Some((Arc::clone(self), client))))
+    }
+
+    /// Counts one more socket for `client` (none when its address is
+    /// unknown), unless it already has [`MAX_SOCKETS_PER_CLIENT`] or the
+    /// mediator has `max`; the guard counts it out when dropped.
+    fn open(self: &Arc<Self>, client: Option<IpAddr>) -> Result<SocketGuard, SocketRefused> {
+        let mut open = self.open.lock().map_err(|_| SocketRefused::Full)?;
+        if open.total >= self.max {
+            return Err(SocketRefused::Full);
+        }
+        if let Some(client) = client {
+            let count = open.by_client.entry(client).or_default();
+            if *count >= MAX_SOCKETS_PER_CLIENT {
+                return Err(SocketRefused::Client);
+            }
+            *count += 1;
+        }
+        open.total += 1;
+        Ok(SocketGuard {
+            sockets: Arc::clone(self),
+            client,
+        })
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        let open = self.open.lock().unwrap();
+        open.total == 0 && open.by_client.is_empty()
     }
 }
 
-struct SocketGuard(Option<(Arc<Sockets>, IpAddr)>);
+struct SocketGuard {
+    sockets: Arc<Sockets>,
+    client: Option<IpAddr>,
+}
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let Some((sockets, client)) = &self.0 else {
+        let Ok(mut open) = self.sockets.open.lock() else {
             return;
         };
-        if let Ok(mut open) = sockets.0.lock()
-            && let Some(count) = open.get_mut(client)
+        open.total = open.total.saturating_sub(1);
+        if let Some(client) = &self.client
+            && let Some(count) = open.by_client.get_mut(client)
         {
             *count -= 1;
             if *count == 0 {
-                open.remove(client);
+                open.by_client.remove(client);
             }
         }
     }
@@ -249,7 +291,7 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
         (status = 415, description = "Content-Type is not `application/didcomm-encrypted+json`", body = ErrorBody),
         (status = 429, description = "Too many requests from this client IP; retry after the `Retry-After` seconds"),
         (status = 503, description = "Storage unavailable; retry later", body = ErrorBody),
-        (status = 507, description = "The forward's recipient queue is full", body = ErrorBody)
+        (status = 507, description = "The forward's recipient queue is full, or the mediator is out of storage", body = ErrorBody)
     )
 )]
 async fn receive(
@@ -283,7 +325,7 @@ async fn receive(
         }
         Err(err @ ReceiveError::BadForward(_)) => error(StatusCode::BAD_REQUEST, err.to_string()),
         Err(err @ ReceiveError::UnknownRecipient) => error(StatusCode::NOT_FOUND, err.to_string()),
-        Err(err @ ReceiveError::QueueFull) => {
+        Err(err @ (ReceiveError::QueueFull | ReceiveError::OutOfStorage)) => {
             error(StatusCode::INSUFFICIENT_STORAGE, err.to_string())
         }
         Err(ReceiveError::Store(err)) => {
@@ -359,7 +401,8 @@ async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
     tag = "didcomm",
     responses(
         (status = 101, description = "Switching to the WebSocket protocol"),
-        (status = 429, description = "Too many requests from this client IP")
+        (status = 429, description = "Too many requests or sockets from this client IP"),
+        (status = 503, description = "The mediator has as many sockets open as it takes; retry after the `Retry-After` seconds")
     )
 )]
 async fn websocket(
@@ -376,8 +419,17 @@ async fn websocket(
     if over_limit(&state, ip).await {
         return too_many_requests();
     }
-    let Some(guard) = state.sockets.open(ip.map(client_key)) else {
-        return too_many_requests();
+    let guard = match state.sockets.open(ip.map(client_key)) {
+        Ok(guard) => guard,
+        Err(SocketRefused::Client) => return too_many_requests(),
+        Err(SocketRefused::Full) => {
+            crate::metrics::METRICS.capacity_refused(crate::metrics::Refusal::WebSockets);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, HeaderValue::from(RATE_WINDOW_SECS))],
+            )
+                .into_response();
+        }
     };
     let max = state.mediator.limits().max_message_bytes;
     upgrade
@@ -660,6 +712,10 @@ pub struct Health {
     /// `redis`, or `memory` in development.
     #[schema(example = "redis")]
     pub storage_kind: &'static str,
+    /// `ok`, or `full` when new mediations are denied (too many held, or the
+    /// store at its high water); the mediations held keep working.
+    #[schema(example = "ok")]
+    pub capacity: &'static str,
 }
 
 /// Health check
@@ -684,6 +740,11 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
         did: state.mediator.identity().did.clone(),
         storage: if healthy { "ok" } else { "unavailable" },
         storage_kind: state.store.kind(),
+        capacity: if state.mediator.at_capacity() {
+            "full"
+        } else {
+            "ok"
+        },
     };
     let status = if healthy {
         StatusCode::OK
@@ -718,7 +779,7 @@ mod tests {
             rate_limit: 0,
             client_ip_header: None,
             public_url: "https://mediator.example.com".into(),
-            sockets: Arc::default(),
+            sockets: Arc::new(Sockets::new(100)),
             stopping: tokio::sync::watch::channel(false).1,
         }
     }
@@ -965,16 +1026,31 @@ mod tests {
 
     #[test]
     fn sockets_are_capped_per_client() {
-        let sockets = Arc::new(Sockets::default());
+        let sockets = Arc::new(Sockets::new(100));
         let client = Some("192.0.2.7".parse().unwrap());
         let open: Vec<_> = (0..MAX_SOCKETS_PER_CLIENT)
             .map(|_| sockets.open(client).unwrap())
             .collect();
-        assert!(sockets.open(client).is_none());
-        assert!(sockets.open(Some("192.0.2.8".parse().unwrap())).is_some());
+        assert_eq!(sockets.open(client).err(), Some(SocketRefused::Client));
+        assert!(sockets.open(Some("192.0.2.8".parse().unwrap())).is_ok());
         drop(open);
-        assert!(sockets.open(client).is_some());
-        assert!(sockets.0.lock().unwrap().is_empty());
+        assert!(sockets.open(client).is_ok());
+        assert!(sockets.is_empty());
+    }
+
+    #[test]
+    fn sockets_are_capped_in_all() {
+        let sockets = Arc::new(Sockets::new(2));
+        let a = sockets.open(Some("192.0.2.7".parse().unwrap())).unwrap();
+        let b = sockets.open(None).unwrap();
+        assert_eq!(
+            sockets.open(Some("192.0.2.8".parse().unwrap())).err(),
+            Some(SocketRefused::Full)
+        );
+        drop(a);
+        assert!(sockets.open(Some("192.0.2.8".parse().unwrap())).is_ok());
+        drop(b);
+        assert!(sockets.is_empty());
     }
 
     #[tokio::test]
@@ -1085,7 +1161,7 @@ mod tests {
         assert_eq!(u16::from(closed.unwrap().code), 1001);
         drop(ws);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(sockets.0.lock().unwrap().is_empty());
+        assert!(sockets.is_empty());
     }
 
     /// A real server, a real WebSocket client: live mode pushes a message the

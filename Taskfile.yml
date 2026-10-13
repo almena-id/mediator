@@ -117,6 +117,12 @@ tasks:
     cmds:
       - docker compose up --build --detach --wait
 
+  up:no-caddy:
+    desc: Start the mediator in Docker without its Caddy (detached), for when ../develop's Caddy serves it on ports 80 and 443
+    cmds:
+      # Every other service, coturn included when its profile is on.
+      - docker compose up --build --detach --wait --scale caddy=0
+
   down:
     desc: Stop and remove the Docker containers
     cmds:

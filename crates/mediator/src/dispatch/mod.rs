@@ -17,6 +17,7 @@ use almena_didcomm::message::now;
 use almena_didcomm::{Attachment, FORWARD, Message, PackOptions, unpack};
 use tokio::sync::mpsc;
 
+use crate::capacity::Capacity;
 use crate::identity::Identity;
 use crate::metrics::{self, METRICS, MessageOutcome, Transport as Via};
 use crate::push::{self, Pusher};
@@ -58,6 +59,8 @@ pub struct Limits {
     pub max_message_bytes: usize,
     pub queue: QueueLimits,
     pub max_recipient_dids: usize,
+    /// Mediations held at once; a new one past it is denied. 0: no limit.
+    pub max_mediations: u64,
     /// Least time between two pushes to one mediation.
     pub push_min_interval_secs: u64,
     /// Least time between two call rings to one mediation.
@@ -93,6 +96,8 @@ pub enum ReceiveError {
     UnknownRecipient,
     #[error("the recipient's queue is full")]
     QueueFull,
+    #[error("the mediator is out of storage, retry later")]
+    OutOfStorage,
     #[error("storage: {0:#}")]
     Store(#[from] anyhow::Error),
 }
@@ -120,6 +125,8 @@ pub struct Mediator {
     pusher: Option<Arc<dyn Pusher>>,
     /// TURN credentials; `None` turns the TURN protocol off.
     turn: Option<TurnServer>,
+    /// Whether the store has room for new mediations and messages.
+    capacity: Arc<Capacity>,
 }
 
 impl Mediator {
@@ -147,7 +154,29 @@ impl Mediator {
             transport,
             pusher: None,
             turn: None,
+            capacity: Arc::new(Capacity::new(100)),
         }
+    }
+
+    /// The store counts as full from `percent` of its memory ceiling on.
+    pub fn with_store_high_water(mut self, percent: u8) -> Self {
+        self.capacity = Arc::new(Capacity::new(percent));
+        self
+    }
+
+    pub fn capacity(&self) -> &Capacity {
+        &self.capacity
+    }
+
+    /// Whether a new mediation would be denied, as last sampled.
+    pub fn at_capacity(&self) -> bool {
+        let max = self.limits.max_mediations;
+        self.capacity.store_full() || (max > 0 && self.capacity.mediations() >= max)
+    }
+
+    /// Starts sampling the store's room in the background.
+    pub fn start_capacity_watch(&self) {
+        self.capacity.watch(Arc::clone(&self.store));
     }
 
     /// Turns push wake-ups on.
@@ -334,7 +363,10 @@ impl Mediator {
             },
         );
         if let Err(
-            ReceiveError::BadForward(_) | ReceiveError::UnknownRecipient | ReceiveError::QueueFull,
+            ReceiveError::BadForward(_)
+            | ReceiveError::UnknownRecipient
+            | ReceiveError::QueueFull
+            | ReceiveError::OutOfStorage,
         ) = &result
         {
             METRICS.forward(metrics::Forward::Refused, 1);
@@ -1042,7 +1074,7 @@ mod tests {
         for wallet in [&idle, &active] {
             mediator
                 .store()
-                .grant_mediation(&wallet.did, 1_000)
+                .grant_mediation(&wallet.did, 1_000, 0)
                 .await
                 .unwrap();
         }
@@ -1279,6 +1311,79 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ReceiveError::QueueFull));
+    }
+
+    #[tokio::test]
+    async fn new_mediations_are_denied_past_the_limit_and_held_ones_kept() {
+        let mediator = Mediator::new(
+            Identity::ephemeral("https://mediator.example.com").unwrap(),
+            Arc::new(crate::store::MemoryStore::new()),
+            Limits {
+                max_mediations: 1,
+                ..crate::testing::LIMITS
+            },
+            None,
+        );
+        let (bob, carol) = (Wallet::new(Curve::X25519), Wallet::new(Curve::X25519));
+        mediate(&mediator, &bob).await;
+        let denied = carol
+            .request(&mediator, protocols::MEDIATE_REQUEST, json!({}))
+            .await;
+        assert_eq!(denied.type_, protocols::MEDIATE_DENY);
+        assert!(!mediator.store().has_mediation(&carol.did).await.unwrap());
+        // Bob asks again, as his wallet does on every start: still granted.
+        let again = bob
+            .request(&mediator, protocols::MEDIATE_REQUEST, json!({}))
+            .await;
+        assert_eq!(again.type_, protocols::MEDIATE_GRANT);
+    }
+
+    #[tokio::test]
+    async fn a_full_store_takes_no_new_mediation_or_message_but_lets_pickup_free_it() {
+        let mediator = mediator();
+        let bob = Wallet::mediated_by(&mediator.identity().did);
+        let (alice, carol) = (Wallet::new(Curve::X25519), Wallet::new(Curve::X25519));
+        mediate(&mediator, &bob).await;
+        send_via_mediator(&mediator, &alice, &bob, "before")
+            .await
+            .unwrap();
+
+        mediator.capacity().set_store_full(true);
+        assert!(mediator.at_capacity());
+        let denied = carol
+            .request(&mediator, protocols::MEDIATE_REQUEST, json!({}))
+            .await;
+        assert_eq!(denied.type_, protocols::MEDIATE_DENY);
+        let again = bob
+            .request(&mediator, protocols::MEDIATE_REQUEST, json!({}))
+            .await;
+        assert_eq!(again.type_, protocols::MEDIATE_GRANT);
+        let err = send_via_mediator(&mediator, &alice, &bob, "after")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ReceiveError::OutOfStorage));
+        // What is queued still comes out and is acknowledged.
+        let delivery = bob
+            .request(&mediator, protocols::DELIVERY_REQUEST, json!({"limit": 10}))
+            .await;
+        let ids: Vec<_> = delivery
+            .attachments
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id.unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1);
+        bob.request(
+            &mediator,
+            protocols::MESSAGES_RECEIVED,
+            json!({"message_id_list": ids}),
+        )
+        .await;
+
+        mediator.capacity().set_store_full(false);
+        send_via_mediator(&mediator, &alice, &bob, "after")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

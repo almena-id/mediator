@@ -15,6 +15,7 @@ pub const PROBLEM_REPORT: &str = "https://didcomm.org/report-problem/2.0/problem
 pub const COORDINATE_MEDIATION: &str = "https://didcomm.org/coordinate-mediation/3.0/";
 pub const MEDIATE_REQUEST: &str = "https://didcomm.org/coordinate-mediation/3.0/mediate-request";
 pub const MEDIATE_GRANT: &str = "https://didcomm.org/coordinate-mediation/3.0/mediate-grant";
+pub const MEDIATE_DENY: &str = "https://didcomm.org/coordinate-mediation/3.0/mediate-deny";
 pub const RECIPIENT_UPDATE: &str = "https://didcomm.org/coordinate-mediation/3.0/recipient-update";
 pub const RECIPIENT_UPDATE_RESPONSE: &str =
     "https://didcomm.org/coordinate-mediation/3.0/recipient-update-response";

@@ -101,6 +101,13 @@ pub struct RelayLimits {
     pub bytes: u64,
 }
 
+/// How much memory the store uses, against the ceiling it is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreMemory {
+    pub used: u64,
+    pub max: u64,
+}
+
 /// Queue limits, from the configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueLimits {
@@ -120,7 +127,13 @@ pub trait Store: Send + Sync {
     fn kind(&self) -> &'static str;
 
     /// Records a granted mediation (idempotent) and counts it as active now.
-    async fn grant_mediation(&self, mediation: &str, now: u64) -> Result<()>;
+    /// A new one is refused (`false`) when `max` mediations are held already
+    /// (0: no limit); one already held is always granted again.
+    async fn grant_mediation(&self, mediation: &str, now: u64, max: u64) -> Result<bool>;
+    /// How many mediations are held.
+    async fn mediation_count(&self) -> Result<u64>;
+    /// The store's memory against its ceiling; `None` when it has none.
+    async fn memory(&self) -> Result<Option<StoreMemory>>;
     /// The mediation's wallet did something at `now`; nothing if there is no
     /// such mediation.
     async fn touch_mediation(&self, mediation: &str, now: u64) -> Result<()>;
@@ -287,10 +300,21 @@ pub(crate) mod contract {
         store.ping().await.unwrap();
 
         assert!(!store.has_mediation(&m1).await.unwrap());
-        store.grant_mediation(&m1, 100).await.unwrap();
-        store.grant_mediation(&m1, 100).await.unwrap();
-        store.grant_mediation(&m2, 100).await.unwrap();
+        assert!(store.grant_mediation(&m1, 100, 0).await.unwrap());
+        assert!(store.grant_mediation(&m1, 100, 0).await.unwrap());
+        assert!(store.grant_mediation(&m2, 100, 0).await.unwrap());
         assert!(store.has_mediation(&m1).await.unwrap());
+        store.memory().await.unwrap();
+
+        // At the ceiling a new mediation is refused, one held is not.
+        let held = store.mediation_count().await.unwrap();
+        assert!(held >= 2);
+        let late = format!("did:peer:late-{tag}");
+        assert!(!store.grant_mediation(&late, 100, held).await.unwrap());
+        assert!(!store.has_mediation(&late).await.unwrap());
+        assert!(store.grant_mediation(&m1, 100, held).await.unwrap());
+        assert!(store.grant_mediation(&late, 100, held + 1).await.unwrap());
+        assert_eq!(store.mediation_count().await.unwrap(), held + 1);
 
         assert_eq!(
             store.add_recipient(&m1, &r2, 2).await.unwrap(),
@@ -510,8 +534,8 @@ pub(crate) mod contract {
             format!("did:peer:active-{tag}"),
         );
         let idle_r = format!("did:peer:idle-r-{tag}");
-        store.grant_mediation(&idle, 1_000).await.unwrap();
-        store.grant_mediation(&active, 1_000).await.unwrap();
+        store.grant_mediation(&idle, 1_000, 0).await.unwrap();
+        store.grant_mediation(&active, 1_000, 0).await.unwrap();
         store.touch_mediation(&active, 5_000).await.unwrap();
         store
             .touch_mediation(&format!("did:peer:none-{tag}"), 5_000)

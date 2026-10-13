@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use super::{
     AddRecipient, PendingRelay, QueueLimits, QueueSummary, Queued, RelayLimits, RemoveRecipient,
-    Store, id_millis,
+    Store, StoreMemory, id_millis,
 };
 use crate::push::{Device, Service};
 
@@ -71,11 +71,24 @@ impl Store for MemoryStore {
         "memory"
     }
 
-    async fn grant_mediation(&self, mediation: &str, now: u64) -> Result<()> {
+    async fn grant_mediation(&self, mediation: &str, now: u64, max: u64) -> Result<bool> {
         let mut inner = self.lock()?;
+        if !inner.mediations.contains(mediation) && max > 0 && inner.mediations.len() as u64 >= max
+        {
+            return Ok(false);
+        }
         inner.mediations.insert(mediation.to_owned());
         inner.seen.insert(mediation.to_owned(), now);
-        Ok(())
+        Ok(true)
+    }
+
+    async fn mediation_count(&self) -> Result<u64> {
+        Ok(self.lock()?.mediations.len() as u64)
+    }
+
+    /// The process's memory is not the store's to bound.
+    async fn memory(&self) -> Result<Option<StoreMemory>> {
+        Ok(None)
     }
 
     async fn touch_mediation(&self, mediation: &str, now: u64) -> Result<()> {

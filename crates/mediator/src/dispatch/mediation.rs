@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::protocols::{self, Problem};
 use super::{Handled, Mediator, ReceiveError};
-use crate::metrics::{Forward, METRICS};
+use crate::metrics::{Forward, METRICS, Refusal};
 use crate::store::{AddRecipient, Queued, RemoveRecipient};
 
 /// Handles a Coordinate Mediation message from `requester` (an authenticated DID).
@@ -20,8 +20,25 @@ pub async fn handle(
     let store = mediator.store();
     match message.type_.as_str() {
         protocols::MEDIATE_REQUEST => {
-            // Open with limits (SPEC.md §11): every request is granted.
-            store.grant_mediation(requester, now()).await?;
+            // Open with limits (SPEC.md §11): granted while there is room;
+            // a mediation already held always is, so its wallet keeps working.
+            let refused =
+                if mediator.capacity().store_full() && !store.has_mediation(requester).await? {
+                    Some(Refusal::Storage)
+                } else if !store
+                    .grant_mediation(requester, now(), mediator.limits().max_mediations)
+                    .await?
+                {
+                    Some(Refusal::Mediations)
+                } else {
+                    None
+                };
+            if let Some(refusal) = refused {
+                METRICS.capacity_refused(refusal);
+                tracing::debug!(mediation = %requester, ?refusal, "mediation denied: at capacity");
+                let deny = Message::new(protocols::MEDIATE_DENY, json!({}));
+                return Ok(Handled::Reply(deny.reply_to(message)));
+            }
             METRICS.mediation_granted();
             tracing::debug!(mediation = %requester, "mediation granted");
             let grant = Message::new(
@@ -263,6 +280,10 @@ async fn queue_all(
     recipient: &str,
     payloads: Vec<String>,
 ) -> Result<(), ReceiveError> {
+    if mediator.capacity().store_full() {
+        METRICS.capacity_refused(Refusal::Storage);
+        return Err(ReceiveError::OutOfStorage);
+    }
     let received = now();
     let ids = mediator
         .store()

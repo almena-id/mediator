@@ -7,6 +7,7 @@ use almena_mediator::dispatch::turn::TurnServer;
 use almena_mediator::dispatch::{Limits, Mediator};
 use almena_mediator::identity::Identity;
 use almena_mediator::push::{Apns, DirectPusher, Fcm, Pusher};
+use almena_mediator::routes::Sockets;
 use almena_mediator::store::{self, QueueLimits};
 use almena_mediator::transport::{HttpTransport, Transport};
 use almena_mediator::{AppState, Config, config::LogFormat, router};
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
             max_bytes: config.queue_max_bytes,
         },
         max_recipient_dids: config.max_recipient_dids,
+        max_mediations: config.max_mediations,
         push_min_interval_secs: config.push.min_interval_secs,
         push_ring_interval_secs: config.push.ring_interval_secs,
         recipient_proof: config.recipient_proof,
@@ -66,7 +68,13 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let mut mediator = Mediator::new(identity, Arc::clone(&store), limits, transport);
+    if store.kind() == "redis" && store.memory().await?.is_none() {
+        tracing::warn!(
+            "Redis has no maxmemory: ALMENA_STORE_HIGH_WATER has nothing to measure against"
+        );
+    }
+    let mut mediator = Mediator::new(identity, Arc::clone(&store), limits, transport)
+        .with_store_high_water(config.store_high_water);
     if config.push.mode == PushMode::Direct {
         let fcm = config
             .push
@@ -90,6 +98,7 @@ async fn main() -> Result<()> {
     }
     mediator.start_relay_retries();
     mediator.start_cleanup();
+    mediator.start_capacity_watch();
     let did = mediator.identity().did.clone();
     let (stop, mut stopping) = tokio::sync::watch::channel(false);
     let state = AppState {
@@ -102,7 +111,7 @@ async fn main() -> Result<()> {
             .as_deref()
             .map(axum::http::HeaderName::try_from)
             .transpose()?,
-        sockets: Arc::default(),
+        sockets: Arc::new(Sockets::new(config.max_sockets)),
         stopping: stopping.clone(),
     };
 

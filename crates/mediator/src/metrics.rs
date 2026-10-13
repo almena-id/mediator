@@ -13,6 +13,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 
 use crate::push::Service;
+use crate::store::StoreMemory;
 
 /// The process's metrics.
 pub static METRICS: Metrics = Metrics::new();
@@ -47,6 +48,17 @@ pub enum Forward {
     Refused,
 }
 
+/// What the mediator refused for want of room (SPEC.md §11).
+#[derive(Debug, Clone, Copy)]
+pub enum Refusal {
+    /// A new mediation, with `ALMENA_MAX_MEDIATIONS` held.
+    Mediations,
+    /// A new mediation or message, with the store at its high water.
+    Storage,
+    /// A WebSocket, with `ALMENA_MAX_SOCKETS` open.
+    WebSockets,
+}
+
 /// What became of a relay retry.
 #[derive(Debug, Clone, Copy)]
 pub enum Retry {
@@ -78,6 +90,11 @@ const FORWARDS: [(Forward, &str); 5] = [
     (Forward::RelayScheduled, "relay_scheduled"),
     (Forward::RelayDropped, "relay_dropped"),
     (Forward::Refused, "refused"),
+];
+const REFUSALS: [(Refusal, &str); 3] = [
+    (Refusal::Mediations, "mediations"),
+    (Refusal::Storage, "storage"),
+    (Refusal::WebSockets, "websockets"),
 ];
 const RETRIES: [(Retry, &str); 3] = [
     (Retry::Delivered, "delivered"),
@@ -115,6 +132,11 @@ pub struct Metrics {
     mediations_granted: AtomicU64,
     mediations_removed: AtomicU64,
     turn_credentials: AtomicU64,
+    capacity_refused: [AtomicU64; 3],
+    mediations: AtomicU64,
+    store_memory_used: AtomicU64,
+    store_memory_max: AtomicU64,
+    store_full: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -144,6 +166,11 @@ impl Metrics {
             mediations_granted: AtomicU64::new(0),
             mediations_removed: AtomicU64::new(0),
             turn_credentials: AtomicU64::new(0),
+            capacity_refused: [const { AtomicU64::new(0) }; 3],
+            mediations: AtomicU64::new(0),
+            store_memory_used: AtomicU64::new(0),
+            store_memory_max: AtomicU64::new(0),
+            store_full: AtomicU64::new(0),
         }
     }
 
@@ -227,6 +254,24 @@ impl Metrics {
 
     pub fn turn_credentials(&self) {
         inc(&self.turn_credentials, 1);
+    }
+
+    pub fn capacity_refused(&self, refusal: Refusal) {
+        inc(&self.capacity_refused[refusal as usize], 1);
+    }
+
+    /// Mediations held, as last sampled.
+    pub fn mediations(&self, count: u64) {
+        self.mediations.store(count, Ordering::Relaxed);
+    }
+
+    /// The store's memory as last sampled (0 / 0 without a ceiling), and
+    /// whether it is at its high water.
+    pub fn store_memory(&self, memory: Option<StoreMemory>, full: bool) {
+        let (used, max) = memory.map_or((0, 0), |m| (m.used, m.max));
+        self.store_memory_used.store(used, Ordering::Relaxed);
+        self.store_memory_max.store(max, Ordering::Relaxed);
+        self.store_full.store(u64::from(full), Ordering::Relaxed);
     }
 
     /// The Prometheus text exposition format (version 0.0.4).
@@ -436,6 +481,60 @@ impl Metrics {
             "almena_turn_credentials_total {}",
             get(&self.turn_credentials)
         );
+
+        family(
+            &mut out,
+            "almena_capacity_refused_total",
+            "counter",
+            "New mediations, messages and WebSockets refused for want of room.",
+        );
+        for (r, reason) in REFUSALS {
+            let _ = writeln!(
+                out,
+                "almena_capacity_refused_total{{reason=\"{reason}\"}} {}",
+                get(&self.capacity_refused[r as usize])
+            );
+        }
+
+        family(
+            &mut out,
+            "almena_mediations",
+            "gauge",
+            "Mediations held, as last sampled.",
+        );
+        let _ = writeln!(out, "almena_mediations {}", get(&self.mediations));
+
+        family(
+            &mut out,
+            "almena_store_memory_bytes",
+            "gauge",
+            "Memory the store (Redis) uses, as last sampled.",
+        );
+        let _ = writeln!(
+            out,
+            "almena_store_memory_bytes {}",
+            get(&self.store_memory_used)
+        );
+
+        family(
+            &mut out,
+            "almena_store_memory_max_bytes",
+            "gauge",
+            "The store's memory ceiling (Redis maxmemory); 0: none.",
+        );
+        let _ = writeln!(
+            out,
+            "almena_store_memory_max_bytes {}",
+            get(&self.store_memory_max)
+        );
+
+        family(
+            &mut out,
+            "almena_store_full",
+            "gauge",
+            "1 while the store is at ALMENA_STORE_HIGH_WATER: new mediations and messages refused.",
+        );
+        let _ = writeln!(out, "almena_store_full {}", get(&self.store_full));
         out
     }
 }
@@ -491,6 +590,15 @@ mod tests {
         metrics.live_session_opened();
         metrics.websocket_opened();
         metrics.websocket_opened();
+        metrics.capacity_refused(Refusal::Storage);
+        metrics.mediations(7);
+        metrics.store_memory(
+            Some(StoreMemory {
+                used: 950,
+                max: 1000,
+            }),
+            true,
+        );
         metrics.message_took(Duration::from_millis(20));
         metrics.message_took(Duration::from_secs(60));
         let text = metrics.render();
@@ -506,6 +614,12 @@ mod tests {
         assert!(!text.contains("almena_pushes_total{service=\"apns-voip\""));
         assert!(text.contains("almena_live_sessions 1"));
         assert!(text.contains("almena_websocket_connections 2"));
+        assert!(text.contains("almena_capacity_refused_total{reason=\"storage\"} 1"));
+        assert!(text.contains("almena_capacity_refused_total{reason=\"mediations\"} 0"));
+        assert!(text.contains("almena_mediations 7"));
+        assert!(text.contains("almena_store_memory_bytes 950"));
+        assert!(text.contains("almena_store_memory_max_bytes 1000"));
+        assert!(text.contains("almena_store_full 1"));
         assert!(text.contains("almena_didcomm_message_seconds_bucket{le=\"0.01\"} 0"));
         assert!(text.contains("almena_didcomm_message_seconds_bucket{le=\"0.025\"} 1"));
         assert!(text.contains("almena_didcomm_message_seconds_bucket{le=\"10\"} 1"));

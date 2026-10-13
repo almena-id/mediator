@@ -38,6 +38,14 @@ pub struct Config {
     pub queue_max_bytes: u64,
     /// Recipient DIDs per mediation (`ALMENA_MAX_RECIPIENT_DIDS`).
     pub max_recipient_dids: usize,
+    /// Mediations the mediator holds at once; a new one past it is denied.
+    /// 0 = no limit (`ALMENA_MAX_MEDIATIONS`).
+    pub max_mediations: u64,
+    /// Per cent of the store's memory ceiling (Redis `maxmemory`) past which
+    /// no new mediation or message is taken (`ALMENA_STORE_HIGH_WATER`).
+    pub store_high_water: u8,
+    /// WebSockets open at once, from every client (`ALMENA_MAX_SOCKETS`).
+    pub max_sockets: usize,
     /// A mediation whose wallet sends nothing for this many seconds is removed
     /// with everything it owns; 0 keeps them forever (`ALMENA_MEDIATION_TTL`).
     pub mediation_ttl_secs: u64,
@@ -141,9 +149,12 @@ impl Default for Config {
             redis_password: None,
             max_message_bytes: 1024 * 1024,
             queue_ttl_secs: 30 * 24 * 3600,
-            queue_max_messages: 10_000,
-            queue_max_bytes: 100 * 1024 * 1024,
+            queue_max_messages: 1_000,
+            queue_max_bytes: 10 * 1024 * 1024,
             max_recipient_dids: 100,
+            max_mediations: 10_000,
+            store_high_water: 90,
+            max_sockets: 5_000,
             recipient_proof: true,
             mediation_ttl_secs: 90 * 24 * 3600,
             rate_limit: 60,
@@ -235,6 +246,18 @@ impl Config {
                 "ALMENA_MAX_RECIPIENT_DIDS",
                 default.max_recipient_dids,
             )?,
+            max_mediations: match lookup("ALMENA_MAX_MEDIATIONS") {
+                Some(v) => v
+                    .parse()
+                    .with_context(|| format!("invalid ALMENA_MAX_MEDIATIONS: {v}"))?,
+                None => default.max_mediations,
+            },
+            store_high_water: positive(
+                &lookup,
+                "ALMENA_STORE_HIGH_WATER",
+                default.store_high_water,
+            )?,
+            max_sockets: positive(&lookup, "ALMENA_MAX_SOCKETS", default.max_sockets)?,
             mediation_ttl_secs: match lookup("ALMENA_MEDIATION_TTL") {
                 Some(v) => v
                     .parse()
@@ -269,6 +292,11 @@ impl Config {
             "ALMENA_QUEUE_MAX_BYTES ({}) is below ALMENA_MAX_MESSAGE_BYTES ({}): no message would fit",
             config.queue_max_bytes,
             config.max_message_bytes
+        );
+        anyhow::ensure!(
+            config.store_high_water <= 100,
+            "invalid ALMENA_STORE_HIGH_WATER: {} (expected a per cent, 1 to 100)",
+            config.store_high_water
         );
         Ok(config)
     }
@@ -423,6 +451,9 @@ mod tests {
             ("ALMENA_QUEUE_MAX_MESSAGES", "5"),
             ("ALMENA_QUEUE_MAX_BYTES", "4096"),
             ("ALMENA_MAX_RECIPIENT_DIDS", "7"),
+            ("ALMENA_MAX_MEDIATIONS", "0"),
+            ("ALMENA_STORE_HIGH_WATER", "75"),
+            ("ALMENA_MAX_SOCKETS", "200"),
             ("ALMENA_RECIPIENT_PROOF", "off"),
             ("ALMENA_MEDIATION_TTL", "0"),
             ("ALMENA_RATE_LIMIT", "0"),
@@ -444,6 +475,9 @@ mod tests {
         assert_eq!(config.queue_max_messages, 5);
         assert_eq!(config.queue_max_bytes, 4096);
         assert_eq!(config.max_recipient_dids, 7);
+        assert_eq!(config.max_mediations, 0);
+        assert_eq!(config.store_high_water, 75);
+        assert_eq!(config.max_sockets, 200);
         assert!(!config.recipient_proof);
         assert_eq!(config.mediation_ttl_secs, 0);
         assert_eq!(config.rate_limit, 0);
@@ -465,6 +499,10 @@ mod tests {
         // A queue smaller than one message.
         assert!(Config::from_lookup(lookup(&[("ALMENA_QUEUE_MAX_BYTES", "1000")])).is_err());
         assert!(Config::from_lookup(lookup(&[("ALMENA_CLIENT_IP_HEADER", "bad header")])).is_err());
+        assert!(Config::from_lookup(lookup(&[("ALMENA_STORE_HIGH_WATER", "0")])).is_err());
+        assert!(Config::from_lookup(lookup(&[("ALMENA_STORE_HIGH_WATER", "101")])).is_err());
+        assert!(Config::from_lookup(lookup(&[("ALMENA_MAX_SOCKETS", "0")])).is_err());
+        assert!(Config::from_lookup(lookup(&[("ALMENA_MAX_MEDIATIONS", "-1")])).is_err());
     }
 
     #[test]
