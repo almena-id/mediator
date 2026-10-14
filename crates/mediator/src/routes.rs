@@ -15,7 +15,7 @@ use tower_http::trace::TraceLayer;
 use utoipa::openapi::OpenApi as OpenApiDoc;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
-use utoipa_scalar::{Scalar, Servable};
+use utoipa_scalar::Scalar;
 
 use crate::dispatch::{Mediator, Outcome, ReceiveError};
 use crate::store::Store;
@@ -245,9 +245,24 @@ async fn font(Path(name): Path<String>) -> Response {
 
 fn docs(api: OpenApiDoc) -> Router {
     let json = Json(api.clone());
+    // utoipa-scalar's page declares no favicon; the mediator's icon goes in
+    // its head so the tab keeps it on the reference too.
+    let page = Html(
+        Scalar::new(api)
+            .title("Almena mediator API")
+            .to_html()
+            .replacen(
+                "</head>",
+                &format!(
+                    r#"<link rel="icon" type="image/png" href="{}"/></head>"#,
+                    home::ICON_PATH
+                ),
+                1,
+            ),
+    );
     Router::new()
         .route(OPENAPI_PATH, get(move || async move { json }))
-        .merge(Scalar::with_url(DOCS_PATH, api).title("Almena mediator API"))
+        .route(DOCS_PATH, get(move || async move { page }))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -951,7 +966,9 @@ mod tests {
     async fn docs_page_is_served() {
         let (status, body) = get(state(), DOCS_PATH).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(String::from_utf8(body).unwrap().contains("/didcomm"));
+        let page = String::from_utf8(body).unwrap();
+        assert!(page.contains("/didcomm"));
+        assert!(page.contains(r#"<link rel="icon" type="image/png" href="/icon.png"/>"#));
     }
 
     #[tokio::test]
