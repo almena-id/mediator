@@ -36,6 +36,8 @@ All settings are `ALMENA_*` environment variables; [.env.example](.env.example) 
 | `ALMENA_PUSH_RING_INTERVAL` | `5` | Least seconds between two call rings to one wallet |
 | `ALMENA_TURN_URLS` / `ALMENA_TURN_SECRET` | — | TURN relay for calls: URIs given to wallets and the secret shared with coturn (`task init` generates it; coturn runs under the `turn` Compose profile) |
 | `ALMENA_METRICS_ADDR` | — | Prometheus metrics on their own address |
+| `ALMENA_CLIENT_IP_HEADER` / `ALMENA_TRUSTED_PROXIES` | — / loopback and private ranges | Behind a proxy: the header with the client IP, believed only from those peers (CIDRs) |
+| `ALMENA_RATE_LIMIT` / `ALMENA_RELAY_RATE_LIMIT` | `60` / `600` | Messages per minute per client; relays per minute per destination host |
 | `ALMENA_MAX_MEDIATIONS` / `ALMENA_STORE_HIGH_WATER` / `ALMENA_MAX_SOCKETS` | `10000` / `90` / `5000` | Ceilings in all: mediations held, per cent of Redis `maxmemory`, WebSockets open; past them only what is new is refused (SPEC.md §11) |
 
 Keep `keys.json` (the `mediator-data` volume) private and backed up: it is the mediator's identity.

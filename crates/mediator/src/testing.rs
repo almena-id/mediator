@@ -25,6 +25,7 @@ pub const LIMITS: Limits = Limits {
     // Off so tests can register any DID; the proof has tests of its own.
     recipient_proof: false,
     mediation_ttl_secs: 90 * 24 * 3600,
+    relay_rate_limit: 0,
 };
 
 /// A mediator at `https://mediator.example.com` with an empty in-memory store.

@@ -55,10 +55,22 @@ pub struct Config {
     /// `POST /didcomm` requests per minute per client IP; 0 turns the limit
     /// off (`ALMENA_RATE_LIMIT`).
     pub rate_limit: u64,
+    /// What to do when the store cannot count a request against the rate
+    /// limit (`ALMENA_RATE_LIMIT_ON_ERROR`: `closed`, the default, refuses it
+    /// with `503`; `open` lets it through).
+    pub rate_limit_on_error: OnError,
     /// Header holding the client IP when the mediator runs behind a reverse
     /// proxy, e.g. `x-forwarded-for` (`ALMENA_CLIENT_IP_HEADER`). Its last
     /// value is used: the one the proxy added. Unset: the peer address.
     pub client_ip_header: Option<String>,
+    /// Peers whose client IP header is believed (`ALMENA_TRUSTED_PROXIES`,
+    /// comma-separated CIDRs); from anyone else the peer address counts.
+    /// Default: loopback and the private ranges, where the proxy in front of
+    /// the mediator is (Caddy on the Compose network).
+    pub trusted_proxies: Vec<IpNet>,
+    /// Relays to one destination host per minute; 0 turns the limit off
+    /// (`ALMENA_RELAY_RATE_LIMIT`).
+    pub relay_rate_limit: u64,
     /// Relay `forward`s for recipients mediated elsewhere to their mediator, and
     /// resolve other mediators' `did:web` over HTTPS (`ALMENA_FEDERATION`).
     pub federation: bool,
@@ -131,6 +143,85 @@ impl Default for PushConfig {
     }
 }
 
+/// Whether a check that cannot be made lets the request through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnError {
+    Open,
+    Closed,
+}
+
+/// An IP network in CIDR notation (`10.0.0.0/8`, `::1/128`); a bare address
+/// is the network of that address alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpNet {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl IpNet {
+    /// Whether `ip` is in this network. An IPv4-mapped IPv6 address counts
+    /// as the IPv4 address it maps.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+impl FromStr for IpNet {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let (addr, prefix) = match value.split_once('/') {
+            Some((addr, prefix)) => (addr, Some(prefix)),
+            None => (value, None),
+        };
+        let addr: IpAddr = addr
+            .parse()
+            .with_context(|| format!("invalid address in {value}"))?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            Some(prefix) => prefix
+                .parse()
+                .ok()
+                .filter(|p| *p <= max)
+                .with_context(|| format!("invalid prefix length in {value}"))?,
+            None => max,
+        };
+        Ok(Self { addr, prefix })
+    }
+}
+
+/// Loopback and the private ranges (RFC 1918, unique local): where a
+/// reverse proxy in front of the mediator connects from.
+pub const DEFAULT_TRUSTED_PROXIES: &str =
+    "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7";
+
+fn ip_nets(key: &str, value: &str) -> Result<Vec<IpNet>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.parse().with_context(|| format!("invalid {key}: {v}")))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Pretty,
@@ -158,7 +249,12 @@ impl Default for Config {
             recipient_proof: true,
             mediation_ttl_secs: 90 * 24 * 3600,
             rate_limit: 60,
+            rate_limit_on_error: OnError::Closed,
             client_ip_header: None,
+            // A constant, which `trusted_proxies_are_networks` parses.
+            trusted_proxies: ip_nets("ALMENA_TRUSTED_PROXIES", DEFAULT_TRUSTED_PROXIES)
+                .unwrap_or_default(),
+            relay_rate_limit: 600,
             federation: true,
             outbound_allow_insecure: false,
             push: PushConfig::default(),
@@ -277,7 +373,28 @@ impl Config {
                     .with_context(|| format!("invalid ALMENA_RATE_LIMIT: {v}"))?,
                 None => default.rate_limit,
             },
+            rate_limit_on_error: match lookup("ALMENA_RATE_LIMIT_ON_ERROR")
+                .as_deref()
+                .map(str::trim)
+            {
+                None => default.rate_limit_on_error,
+                Some("closed") => OnError::Closed,
+                Some("open") => OnError::Open,
+                Some(other) => anyhow::bail!(
+                    "invalid ALMENA_RATE_LIMIT_ON_ERROR: {other} (expected closed or open)"
+                ),
+            },
             client_ip_header,
+            trusted_proxies: match lookup("ALMENA_TRUSTED_PROXIES") {
+                Some(v) => ip_nets("ALMENA_TRUSTED_PROXIES", &v)?,
+                None => default.trusted_proxies,
+            },
+            relay_rate_limit: match lookup("ALMENA_RELAY_RATE_LIMIT") {
+                Some(v) => v
+                    .parse()
+                    .with_context(|| format!("invalid ALMENA_RELAY_RATE_LIMIT: {v}"))?,
+                None => default.relay_rate_limit,
+            },
             federation: boolean(&lookup, "ALMENA_FEDERATION", default.federation)?,
             outbound_allow_insecure: boolean(
                 &lookup,
@@ -458,6 +575,9 @@ mod tests {
             ("ALMENA_MEDIATION_TTL", "0"),
             ("ALMENA_RATE_LIMIT", "0"),
             ("ALMENA_CLIENT_IP_HEADER", "X-Forwarded-For"),
+            ("ALMENA_TRUSTED_PROXIES", "203.0.113.0/24, 2001:db8::1"),
+            ("ALMENA_RATE_LIMIT_ON_ERROR", "open"),
+            ("ALMENA_RELAY_RATE_LIMIT", "0"),
             ("ALMENA_FEDERATION", "false"),
             ("ALMENA_OUTBOUND_ALLOW_INSECURE", "1"),
         ]))
@@ -482,6 +602,15 @@ mod tests {
         assert_eq!(config.mediation_ttl_secs, 0);
         assert_eq!(config.rate_limit, 0);
         assert_eq!(config.client_ip_header.as_deref(), Some("x-forwarded-for"));
+        assert_eq!(
+            config.trusted_proxies,
+            [
+                "203.0.113.0/24".parse().unwrap(),
+                "2001:db8::1/128".parse().unwrap()
+            ]
+        );
+        assert_eq!(config.rate_limit_on_error, OnError::Open);
+        assert_eq!(config.relay_rate_limit, 0);
         assert!(!config.federation);
         assert!(config.outbound_allow_insecure);
     }
@@ -503,6 +632,36 @@ mod tests {
         assert!(Config::from_lookup(lookup(&[("ALMENA_STORE_HIGH_WATER", "101")])).is_err());
         assert!(Config::from_lookup(lookup(&[("ALMENA_MAX_SOCKETS", "0")])).is_err());
         assert!(Config::from_lookup(lookup(&[("ALMENA_MAX_MEDIATIONS", "-1")])).is_err());
+        assert!(Config::from_lookup(lookup(&[("ALMENA_TRUSTED_PROXIES", "10.0.0.0/33")])).is_err());
+        assert!(Config::from_lookup(lookup(&[("ALMENA_TRUSTED_PROXIES", "proxy")])).is_err());
+        assert!(Config::from_lookup(lookup(&[("ALMENA_RATE_LIMIT_ON_ERROR", "maybe")])).is_err());
+    }
+
+    #[test]
+    fn trusted_proxies_are_networks() {
+        let nets = ip_nets("ALMENA_TRUSTED_PROXIES", DEFAULT_TRUSTED_PROXIES).unwrap();
+        let trusted = |ip: &str| nets.iter().any(|n| n.contains(ip.parse().unwrap()));
+        for ip in [
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "172.18.0.5",
+            "192.168.1.1",
+            "fd12::1",
+        ] {
+            assert!(trusted(ip), "{ip}");
+        }
+        // Mapped addresses count as the IPv4 they carry.
+        assert!(trusted("::ffff:172.18.0.5"));
+        for ip in ["203.0.113.9", "172.32.0.1", "2001:db8::1", "::ffff:8.8.8.8"] {
+            assert!(!trusted(ip), "{ip}");
+        }
+        let all: IpNet = "0.0.0.0/0".parse().unwrap();
+        assert!(all.contains("8.8.8.8".parse().unwrap()));
+        assert!(!all.contains("2001:db8::1".parse().unwrap()));
+        // An empty setting trusts nobody.
+        let none = Config::from_lookup(lookup(&[("ALMENA_TRUSTED_PROXIES", "")])).unwrap();
+        assert!(none.trusted_proxies.is_empty());
     }
 
     #[test]

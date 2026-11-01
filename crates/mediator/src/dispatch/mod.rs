@@ -71,6 +71,8 @@ pub struct Limits {
     /// A mediation whose wallet sends nothing for this long is removed with
     /// all it owns; 0 keeps mediations forever.
     pub mediation_ttl_secs: u64,
+    /// Relays to one destination host per minute; 0: no limit.
+    pub relay_rate_limit: u64,
 }
 
 /// What the HTTP layer should answer after a message was accepted.
@@ -96,6 +98,8 @@ pub enum ReceiveError {
     UnknownRecipient,
     #[error("the recipient's queue is full")]
     QueueFull,
+    #[error("too many relays to the recipient's mediator, retry later")]
+    RelayRateLimited,
     #[error("the mediator is out of storage, retry later")]
     OutOfStorage,
     #[error("storage: {0:#}")]
@@ -118,7 +122,7 @@ pub struct Mediator {
     resolver: ChainResolver,
     store: Arc<dyn Store>,
     limits: Limits,
-    live: LiveHub,
+    live: Arc<LiveHub>,
     /// Outbound traffic to other mediators; `None` turns federation off.
     transport: Option<Arc<dyn Transport>>,
     /// Push wake-ups; `None` turns them off.
@@ -127,6 +131,8 @@ pub struct Mediator {
     turn: Option<TurnServer>,
     /// Whether the store has room for new mediations and messages.
     capacity: Arc<Capacity>,
+    /// Notified when a relay is stored, so the worker sends it at once.
+    relays_waiting: Arc<tokio::sync::Notify>,
 }
 
 impl Mediator {
@@ -150,11 +156,12 @@ impl Mediator {
             resolver: ChainResolver::new(resolvers),
             store,
             limits,
-            live: LiveHub::default(),
+            live: Arc::default(),
             transport,
             pusher: None,
             turn: None,
             capacity: Arc::new(Capacity::new(100)),
+            relays_waiting: Arc::default(),
         }
     }
 
@@ -219,6 +226,28 @@ impl Mediator {
         &self.live
     }
 
+    /// Shares live sessions with the other instances on the same store
+    /// (SPEC.md, Appendix E), when the store allows it (Redis). Returns
+    /// whether it does.
+    pub fn start_live_sharing(&self) -> bool {
+        live::start_sharing(&self.live, &self.store)
+    }
+
+    /// Turns live mode on for `mediation` on `session`.
+    pub(crate) async fn go_live(&self, session: &mut Session, mediation: &str) {
+        if let Some(left) = self.live.enable(session, mediation) {
+            live::absent(&self.live, self.store.as_ref(), &left).await;
+        }
+        live::present(&self.live, self.store.as_ref(), mediation).await;
+    }
+
+    /// Turns live mode off on `session`.
+    pub(crate) async fn leave_live(&self, session: &mut Session) {
+        if let Some(left) = self.live.disable(session) {
+            live::absent(&self.live, self.store.as_ref(), &left).await;
+        }
+    }
+
     /// Starts removing idle mediations in the background, once an hour
     /// (unless `mediation_ttl_secs` is 0).
     pub fn start_cleanup(&self) {
@@ -238,11 +267,20 @@ impl Mediator {
         });
     }
 
-    /// Starts retrying failed relays in the background (federation only).
-    pub fn start_relay_retries(&self) {
+    /// Starts sending relays in the background, and retrying the ones that
+    /// failed (federation only).
+    pub fn start_relays(&self) {
         if let Some(transport) = &self.transport {
-            relay::spawn_retries(Arc::clone(&self.store), Arc::clone(transport));
+            relay::spawn_worker(
+                Arc::clone(&self.store),
+                Arc::clone(transport),
+                Arc::clone(&self.relays_waiting),
+            );
         }
+    }
+
+    pub(crate) fn relays_waiting(&self) -> &tokio::sync::Notify {
+        &self.relays_waiting
     }
 
     pub(crate) fn pusher(&self) -> Option<&Arc<dyn Pusher>> {
@@ -258,9 +296,10 @@ impl Mediator {
         if self.live.is_live(mediation) {
             return;
         }
-        let (store, pusher, mediation) = (
+        let (store, pusher, live, mediation) = (
             Arc::clone(&self.store),
             Arc::clone(pusher),
+            Arc::clone(&self.live),
             mediation.to_owned(),
         );
         // A sent push stops further ones until the wallet picks up, but
@@ -268,6 +307,10 @@ impl Mediator {
         let hold = self.limits.queue.ttl_secs;
         let retry = self.limits.push_min_interval_secs;
         tokio::spawn(async move {
+            // Live on another instance: delivered there.
+            if live::is_online(&live, store.as_ref(), &mediation).await {
+                return;
+            }
             if let Err(err) =
                 push::wake(store.as_ref(), pusher.as_ref(), &mediation, hold, retry).await
             {
@@ -285,13 +328,17 @@ impl Mediator {
         if self.live.is_live(mediation) {
             return;
         }
-        let (store, pusher, mediation) = (
+        let (store, pusher, live, mediation) = (
             Arc::clone(&self.store),
             Arc::clone(pusher),
+            Arc::clone(&self.live),
             mediation.to_owned(),
         );
         let interval = self.limits.push_ring_interval_secs;
         tokio::spawn(async move {
+            if live::is_online(&live, store.as_ref(), &mediation).await {
+                return;
+            }
             if let Err(err) =
                 push::ring(store.as_ref(), pusher.as_ref(), &mediation, interval).await
             {
@@ -320,9 +367,9 @@ impl Mediator {
     }
 
     /// Ends a session: no more live pushes for it.
-    pub fn close_session(&self, session: &mut Session) {
+    pub async fn close_session(&self, session: &mut Session) {
         METRICS.websocket_closed();
-        self.live.disable(session);
+        self.leave_live(session).await;
     }
 
     /// Packs a live push as a Message Pickup `delivery` for the session's
@@ -366,6 +413,7 @@ impl Mediator {
             ReceiveError::BadForward(_)
             | ReceiveError::UnknownRecipient
             | ReceiveError::QueueFull
+            | ReceiveError::RelayRateLimited
             | ReceiveError::OutOfStorage,
         ) = &result
         {
@@ -546,10 +594,10 @@ impl Mediator {
                 }
             }
             Ok(None) => {
-                let Some(transport) = self.transport.clone() else {
+                if self.transport.is_none() {
                     tracing::debug!(%sender, "no federation, reply dropped");
                     return;
-                };
+                }
                 let Some(packed) = self.pack_reply(reply, sender, true).await else {
                     return;
                 };
@@ -561,10 +609,9 @@ impl Mediator {
                     tracing::debug!(%sender, "sender routes through us unregistered, reply dropped");
                     return;
                 }
-                let store = Arc::clone(&self.store);
-                tokio::spawn(async move {
-                    relay::deliver(store.as_ref(), transport.as_ref(), uri, packed.message).await;
-                });
+                if let Err(err) = relay::send(self, vec![(uri, packed.message)]).await {
+                    tracing::info!(%sender, error = %err, "reply dropped");
+                }
             }
             Err(err) => {
                 tracing::warn!(%sender, error = %format!("{err:#}"), "reply dropped");
@@ -1434,8 +1481,93 @@ mod tests {
             federation(net.clone() as Arc<dyn crate::transport::Transport>, &net).await;
         let to_a = forward_via(&a, &b, &bob).await;
         assert_eq!(a.receive(&to_a, None).await.unwrap(), Outcome::Accepted);
+        // Answered before it is sent: the worker sends it.
+        let status = bob.request(&b, protocols::STATUS_REQUEST, json!({})).await;
+        assert_eq!(status.body["message_count"], 0);
+        relay::retry_due(a.store(), net.as_ref(), now())
+            .await
+            .unwrap();
         let status = bob.request(&b, protocols::STATUS_REQUEST, json!({})).await;
         assert_eq!(status.body["message_count"], 1);
+    }
+
+    /// A transport whose POSTs never answer.
+    struct Hanging(Arc<InProcess>);
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for Hanging {
+        async fn get_json(&self, url: &str) -> anyhow::Result<serde_json::Value> {
+            self.0.get_json(url).await
+        }
+
+        async fn get_text(&self, url: &str) -> anyhow::Result<String> {
+            self.0.get_text(url).await
+        }
+
+        async fn post_didcomm(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            std::future::pending().await
+        }
+    }
+
+    /// A destination that never answers holds up neither the forward that
+    /// relays to it nor, in the worker, the relays to anyone else.
+    #[tokio::test]
+    async fn a_relay_does_not_wait_for_its_destination() {
+        let net = Arc::new(InProcess::default());
+        let (a, b, bob) = federation(Arc::new(Hanging(net.clone())), &net).await;
+        a.start_relays();
+        let to_a = forward_via(&a, &b, &bob).await;
+        let answered =
+            tokio::time::timeout(std::time::Duration::from_secs(2), a.receive(&to_a, None))
+                .await
+                .expect("the forward is answered before the relay is sent");
+        assert_eq!(answered.unwrap(), Outcome::Accepted);
+        // The worker took it: leased, not due again until the lease ends.
+        for _ in 0..100 {
+            if a.store().due_relays(now(), 0, 10).await.unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the worker never took the relay");
+    }
+
+    #[tokio::test]
+    async fn relays_to_one_destination_are_rate_limited() {
+        let net = Arc::new(InProcess::default());
+        let transport = net.clone() as Arc<dyn crate::transport::Transport>;
+        let a = Arc::new(Mediator::new(
+            Identity::ephemeral("https://a.example").unwrap(),
+            Arc::new(crate::store::MemoryStore::new()),
+            Limits {
+                relay_rate_limit: 2,
+                ..crate::testing::LIMITS
+            },
+            Some(transport),
+        ));
+        let b = mediator_at("https://b.example", Some(net.clone() as _));
+        net.add("https://a.example", &a);
+        net.add("https://b.example", &b);
+        let bob = Wallet::mediated_by(&b.identity().did);
+        mediate(&b, &bob).await;
+        for _ in 0..2 {
+            let to_a = forward_via(&a, &b, &bob).await;
+            assert_eq!(a.receive(&to_a, None).await.unwrap(), Outcome::Accepted);
+        }
+        let to_a = forward_via(&a, &b, &bob).await;
+        assert!(matches!(
+            a.receive(&to_a, None).await,
+            Err(ReceiveError::RelayRateLimited)
+        ));
+        // Refused before it was stored.
+        assert_eq!(
+            a.store()
+                .due_relays(now() + 100_000, 60, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     /// Mediators A (with `a_transport`) and B on `net`, and Bob mediated at B.
@@ -1509,6 +1641,7 @@ mod tests {
         let net = Arc::new(InProcess::default());
         let (a, b, bob) =
             federation(net.clone() as Arc<dyn crate::transport::Transport>, &net).await;
+        a.start_relays();
         // Bob pings A, without return_route: A's answer travels to B.
         ping_without_return_route(&a, &bob, false).await;
         for _ in 0..100 {
@@ -1578,8 +1711,13 @@ mod tests {
         };
         assert_eq!(count(b.clone(), bob.did.clone()).await, 0);
 
-        // Waiting in A's store, not yet due...
+        // The first attempt fails...
         let start = now();
+        relay::retry_due(a.store(), transport.as_ref(), start)
+            .await
+            .unwrap();
+        assert_eq!(count(b.clone(), bob.did.clone()).await, 0);
+        // ...the relay waits in A's store, not yet due...
         relay::retry_due(a.store(), transport.as_ref(), start + 1)
             .await
             .unwrap();
@@ -1607,6 +1745,9 @@ mod tests {
         assert_eq!(a.receive(&to_a, None).await.unwrap(), Outcome::Accepted);
 
         let mut at = now();
+        relay::retry_due(a.store(), transport.as_ref(), at)
+            .await
+            .unwrap();
         for wait in [5, 30, 120, 600] {
             at += wait;
             assert_eq!(a.store().due_relays(at - 1, 0, 10).await.unwrap().len(), 0);
@@ -1844,6 +1985,77 @@ mod tests {
         no_push(&mut sent).await;
     }
 
+    /// Two instances on one Redis (SPEC.md, Appendix E): Bob is live on B,
+    /// Alice's message reaches A. B pushes it to Bob's socket, and A wakes
+    /// no device. Runs when `ALMENA_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn live_delivery_reaches_a_session_on_another_instance() {
+        let Ok(url) = std::env::var("ALMENA_TEST_REDIS_URL") else {
+            eprintln!("ALMENA_TEST_REDIS_URL not set; skipping the two-instance live test");
+            return;
+        };
+        let password = std::env::var("ALMENA_REDIS_PASSWORD")
+            .ok()
+            .filter(|p| !p.is_empty());
+        let keys = tempfile::tempdir().unwrap();
+        let keys = keys.path().join("keys.json");
+        let instance = || async {
+            let store = crate::store::RedisStore::connect(&url, password.as_deref())
+                .await
+                .unwrap();
+            let (pusher, sent) = RecordingPusher::new(&[Service::Fcm, Service::Apns]);
+            let mediator = Mediator::new(
+                Identity::load_or_create(&keys, "https://mediator.example.com").unwrap(),
+                Arc::new(store),
+                crate::testing::LIMITS,
+                None,
+            )
+            .with_pusher(pusher);
+            assert!(mediator.start_live_sharing());
+            (mediator, sent)
+        };
+        let (a, mut a_sent) = instance().await;
+        let (b, mut b_sent) = instance().await;
+        let bob = Wallet::mediated_by(&a.identity().did);
+        let alice = Wallet::new(Curve::X25519);
+        mediate(&a, &bob).await;
+        bob.request(&a, APNS_SET, json!({"device_token": "a1b2"}))
+            .await;
+
+        let (mut session, mut live) = b.open_session();
+        let on = Message::new(
+            protocols::LIVE_DELIVERY_CHANGE,
+            json!({"live_delivery": true}),
+        )
+        .from(&bob.did);
+        let packed = bob.send(b.identity(), on, false).await;
+        b.receive(&packed, Some(&mut session)).await.unwrap();
+
+        // B subscribes in the background: send until a message gets there.
+        let mut sent = 0;
+        let pushed = loop {
+            sent += 1;
+            assert!(sent <= 25, "no live push reached B");
+            send_via_mediator(&a, &alice, &bob, "hi").await.unwrap();
+            if let Ok(Some(pushed)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), live.recv()).await
+            {
+                break pushed;
+            }
+        };
+        assert!(b.live_delivery(&session, pushed).await.is_some());
+        no_push(&mut a_sent).await;
+        no_push(&mut b_sent).await;
+
+        // Once Bob's socket closes, A wakes his phone again.
+        b.close_session(&mut session).await;
+        send_via_mediator(&a, &alice, &bob, "later").await.unwrap();
+        assert_eq!(
+            next_push(&mut a_sent).await,
+            (Pushed::Wake, Service::Apns, "a1b2".into())
+        );
+    }
+
     #[tokio::test]
     async fn a_call_rings_and_a_message_wakes() {
         let (mediator, mut sent) = mediator_with_push();
@@ -2003,6 +2215,7 @@ mod tests {
         );
         net.add("https://a.example", &a);
         net.add("https://b.example", &b);
+        a.start_relays();
         let bob = Wallet::mediated_by(&b.identity().did);
         mediate(&b, &bob).await;
         bob.request(

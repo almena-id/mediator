@@ -28,8 +28,13 @@ services:
       ALMENA_RECIPIENT_PROOF: ${ALMENA_RECIPIENT_PROOF:-required}
       ALMENA_MEDIATION_TTL: ${ALMENA_MEDIATION_TTL:-7776000}
       ALMENA_RATE_LIMIT: ${ALMENA_RATE_LIMIT:-60}
-      # Caddy sets X-Forwarded-For to the client address.
+      # Caddy sets X-Forwarded-For to the client address. It is believed only
+      # from these peers (Caddy reaches the mediator from the Compose
+      # network's private range); anyone else is counted by its own address.
       ALMENA_CLIENT_IP_HEADER: ${ALMENA_CLIENT_IP_HEADER:-x-forwarded-for}
+      ALMENA_TRUSTED_PROXIES: ${ALMENA_TRUSTED_PROXIES:-127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}
+      ALMENA_RATE_LIMIT_ON_ERROR: ${ALMENA_RATE_LIMIT_ON_ERROR:-closed}
+      ALMENA_RELAY_RATE_LIMIT: ${ALMENA_RELAY_RATE_LIMIT:-600}
       ALMENA_FEDERATION: ${ALMENA_FEDERATION:-true}
       ALMENA_OUTBOUND_ALLOW_INSECURE: ${ALMENA_OUTBOUND_ALLOW_INSECURE:-false}
       ALMENA_PUSH_MODE: ${ALMENA_PUSH_MODE:-off}

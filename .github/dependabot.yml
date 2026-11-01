@@ -1,0 +1,28 @@
+# Dependency updates: Dependabot opens a pull request a week per ecosystem,
+# minor and patch updates grouped into one; each runs the checks before
+# anything is merged.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github_actions:
+        update-types: [minor, patch]

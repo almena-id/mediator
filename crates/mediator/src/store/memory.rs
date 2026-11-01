@@ -8,14 +8,17 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
 use super::{
-    AddRecipient, PendingRelay, QueueLimits, QueueSummary, Queued, RelayLimits, RemoveRecipient,
-    Store, StoreMemory, id_millis,
+    AddRecipient, LiveEvent, PendingRelay, QueueLimits, QueueSummary, Queued, RelayLimits,
+    RemoveRecipient, Store, StoreMemory, id_millis,
 };
 use crate::push::{Device, Service};
 
 #[derive(Default)]
 pub struct MemoryStore {
     inner: Mutex<Inner>,
+    /// Tests only: rate-limit counting fails, as a Redis that is down would.
+    #[cfg(test)]
+    pub(crate) failing_hits: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -37,6 +40,8 @@ struct Inner {
     relays: BTreeMap<String, (u64, PendingRelay)>,
     /// Mediation → when its wallet was last active.
     seen: HashMap<String, u64>,
+    /// Mediation → instance → until when it holds a live session.
+    live: HashMap<String, BTreeMap<String, u64>>,
 }
 
 impl MemoryStore {
@@ -259,6 +264,10 @@ impl Store for MemoryStore {
     }
 
     async fn hit(&self, key: &str, window_secs: u64, now: u64) -> Result<u64> {
+        #[cfg(test)]
+        if self.failing_hits.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow!("store down"));
+        }
         let window = now / window_secs.max(1);
         let mut inner = self.lock()?;
         if inner.hits.len() > 100_000 {
@@ -394,6 +403,54 @@ impl Store for MemoryStore {
             .rings
             .insert(mediation.to_owned(), now.saturating_add(interval_secs));
         Ok(true)
+    }
+
+    async fn set_live(
+        &self,
+        mediation: &str,
+        instance: &str,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<()> {
+        let mut inner = self.lock()?;
+        let instances = inner.live.entry(mediation.to_owned()).or_default();
+        instances.retain(|_, until| *until > now);
+        instances.insert(instance.to_owned(), now + ttl_secs);
+        Ok(())
+    }
+
+    async fn clear_live(&self, mediation: &str, instance: &str) -> Result<()> {
+        let mut inner = self.lock()?;
+        if let Some(instances) = inner.live.get_mut(mediation) {
+            instances.remove(instance);
+            if instances.is_empty() {
+                inner.live.remove(mediation);
+            }
+        }
+        Ok(())
+    }
+
+    async fn live_instances(&self, mediation: &str, now: u64) -> Result<Vec<String>> {
+        Ok(self
+            .lock()?
+            .live
+            .get(mediation)
+            .map_or_else(Vec::new, |instances| {
+                instances
+                    .iter()
+                    .filter(|(_, until)| **until > now)
+                    .map(|(instance, _)| instance.clone())
+                    .collect()
+            }))
+    }
+
+    /// One process: its sessions were told already.
+    async fn publish_live(&self, _: &LiveEvent) -> Result<()> {
+        Ok(())
+    }
+
+    fn subscribe_live(&self) -> Option<tokio::sync::mpsc::Receiver<LiveEvent>> {
+        None
     }
 }
 

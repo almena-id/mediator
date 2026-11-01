@@ -17,6 +17,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_scalar::Scalar;
 
+use crate::config::{IpNet, OnError};
 use crate::dispatch::{Mediator, Outcome, ReceiveError};
 use crate::store::Store;
 use crate::{home, oob};
@@ -48,8 +49,12 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     /// `POST /didcomm` requests per minute per client IP; 0 = no limit.
     pub rate_limit: u64,
+    /// Whether a request the store could not count goes through.
+    pub rate_limit_on_error: OnError,
     /// Header with the client IP set by a reverse proxy (see `Config`).
     pub client_ip_header: Option<HeaderName>,
+    /// Peers whose [`AppState::client_ip_header`] is believed.
+    pub trusted_proxies: Arc<[IpNet]>,
     /// The mediator's public origin (`ALMENA_PUBLIC_URL`).
     pub public_url: String,
     /// Open WebSockets, per client (see [`client_key`]) and in all.
@@ -304,8 +309,8 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
         (status = 404, description = "A `forward` for a recipient DID this mediator does not mediate", body = ErrorBody),
         (status = 413, description = "Larger than the mediator accepts (see `max_receive_bytes` in Discover Features)"),
         (status = 415, description = "Content-Type is not `application/didcomm-encrypted+json`", body = ErrorBody),
-        (status = 429, description = "Too many requests from this client IP; retry after the `Retry-After` seconds"),
-        (status = 503, description = "Storage unavailable; retry later", body = ErrorBody),
+        (status = 429, description = "Too many requests from this client IP, or relays to the recipient's mediator; retry after the `Retry-After` seconds"),
+        (status = 503, description = "Storage unavailable (also for counting the request against the rate limit); retry later", body = ErrorBody),
         (status = 507, description = "The forward's recipient queue is full, or the mediator is out of storage", body = ErrorBody)
     )
 )]
@@ -343,6 +348,13 @@ async fn receive(
         Err(err @ (ReceiveError::QueueFull | ReceiveError::OutOfStorage)) => {
             error(StatusCode::INSUFFICIENT_STORAGE, err.to_string())
         }
+        Err(err @ ReceiveError::RelayRateLimited) => {
+            let mut response = error(StatusCode::TOO_MANY_REQUESTS, err.to_string());
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(RATE_WINDOW_SECS));
+            response
+        }
         Err(ReceiveError::Store(err)) => {
             tracing::error!(error = %format!("{err:#}"), "storage failed");
             error(
@@ -355,15 +367,22 @@ async fn receive(
 
 const RATE_WINDOW_SECS: u64 = 60;
 
-/// `429` once the client IP went over the per-minute limit. Storage errors
-/// let the request through: better unlimited than unavailable.
+/// `429` once the client IP went over the per-minute limit; `503` when the
+/// store could not count the request and the limit fails closed.
 async fn rate_limited(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
 ) -> Option<Response> {
-    let ip = client_ip(headers, state.client_ip_header.as_ref(), peer);
-    over_limit(state, ip).await.then(too_many_requests)
+    let ip = client_ip(headers, state, peer);
+    match over_limit(state, ip).await {
+        Verdict::Allowed => None,
+        Verdict::Limited => Some(too_many_requests()),
+        Verdict::Unavailable => Some(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage unavailable, retry later",
+        )),
+    }
 }
 
 fn too_many_requests() -> Response {
@@ -374,11 +393,23 @@ fn too_many_requests() -> Response {
         .into_response()
 }
 
-/// Counts one DIDComm message from `ip` and says whether it is over the
-/// limit. HTTP requests and WebSocket messages share the budget.
-async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
+/// What the rate limit says about one more message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Allowed,
+    /// Over the limit.
+    Limited,
+    /// The store could not count it, and the limit fails closed.
+    Unavailable,
+}
+
+/// Counts one DIDComm message from `ip` and says whether it may go on.
+/// HTTP requests and WebSocket messages share the budget. When the store
+/// fails, `ALMENA_RATE_LIMIT_ON_ERROR` decides; either way it is logged and
+/// counted (`almena_rate_limit_failures_total`).
+async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> Verdict {
     let (Some(ip), true) = (ip, state.rate_limit > 0) else {
-        return false;
+        return Verdict::Allowed;
     };
     match state
         .store
@@ -391,13 +422,23 @@ async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
     {
         Ok(hits) if hits > state.rate_limit => {
             crate::metrics::METRICS.rate_limited();
-            true
+            Verdict::Limited
         }
-        Ok(_) => false,
+        Ok(_) => Verdict::Allowed,
         Err(err) => {
+            let open = state.rate_limit_on_error == OnError::Open;
             crate::metrics::METRICS.store_error();
-            tracing::warn!(error = %format!("{err:#}"), "rate limit check failed");
-            false
+            crate::metrics::METRICS.rate_limit_failed(open);
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                outcome = if open { "allowed" } else { "refused" },
+                "rate limit check failed"
+            );
+            if open {
+                Verdict::Allowed
+            } else {
+                Verdict::Unavailable
+            }
         }
     }
 }
@@ -417,7 +458,7 @@ async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
     responses(
         (status = 101, description = "Switching to the WebSocket protocol"),
         (status = 429, description = "Too many requests or sockets from this client IP"),
-        (status = 503, description = "The mediator has as many sockets open as it takes; retry after the `Retry-After` seconds")
+        (status = 503, description = "The mediator has as many sockets open as it takes (retry after the `Retry-After` seconds), or storage is unavailable")
     )
 )]
 async fn websocket(
@@ -426,13 +467,16 @@ async fn websocket(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let ip = client_ip(
-        &headers,
-        state.client_ip_header.as_ref(),
-        connect.map(|c| c.0.0),
-    );
-    if over_limit(&state, ip).await {
-        return too_many_requests();
+    let ip = client_ip(&headers, &state, connect.map(|c| c.0.0));
+    match over_limit(&state, ip).await {
+        Verdict::Allowed => {}
+        Verdict::Limited => return too_many_requests(),
+        Verdict::Unavailable => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage unavailable, retry later",
+            );
+        }
     }
     let guard = match state.sockets.open(ip.map(client_key)) {
         Ok(guard) => guard,
@@ -478,12 +522,18 @@ async fn websocket_session(
                     Some(Ok(WsMessage::Close(_)) | Err(_)) | None => break,
                 };
                 // Every frame the peer sends counts, whether it opens or not.
-                if over_limit(&state, ip).await {
+                let refused = match over_limit(&state, ip).await {
+                    Verdict::Allowed => None,
                     // 1008: policy violation.
+                    Verdict::Limited => Some((1008, "rate limit")),
+                    // 1013: try again later.
+                    Verdict::Unavailable => Some((1013, "storage unavailable")),
+                };
+                if let Some((code, reason)) = refused {
                     let _ = socket
                         .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
-                            code: 1008,
-                            reason: "rate limit".into(),
+                            code,
+                            reason: reason.into(),
                         })))
                         .await;
                     break;
@@ -529,7 +579,7 @@ async fn websocket_session(
             }
         }
     }
-    mediator.close_session(&mut session);
+    mediator.close_session(&mut session).await;
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -580,23 +630,23 @@ async fn invitation_page(State(state): State<AppState>) -> Html<String> {
 }
 
 /// The client IP: the last address in the configured proxy header (the one
-/// our proxy added), else the TCP peer — also when the header is configured
-/// but missing, so leaving it out does not escape the rate limit.
-fn client_ip(
-    headers: &HeaderMap,
-    header: Option<&HeaderName>,
-    peer: Option<SocketAddr>,
-) -> Option<IpAddr> {
-    match header {
-        Some(name) => headers
+/// our proxy added) when the TCP peer is a trusted proxy, else the peer —
+/// also when the header is missing, so leaving it out does not escape the
+/// rate limit, and when the peer is anyone else, so writing it does not
+/// either.
+fn client_ip(headers: &HeaderMap, state: &AppState, peer: Option<SocketAddr>) -> Option<IpAddr> {
+    let peer = peer.map(|p| p.ip());
+    let trusted = |ip: IpAddr| state.trusted_proxies.iter().any(|net| net.contains(ip));
+    match (&state.client_ip_header, peer) {
+        (Some(name), Some(peer)) if trusted(peer) => headers
             .get_all(name)
             .iter()
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(','))
             .filter_map(|v| v.trim().parse().ok())
             .next_back()
-            .or_else(|| peer.map(|p| p.ip())),
-        None => peer.map(|p| p.ip()),
+            .or(Some(peer)),
+        _ => peer,
     }
 }
 
@@ -781,6 +831,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::Config;
     use crate::store::MemoryStore;
     use crate::testing::{LIMITS, Wallet, mediator_on};
 
@@ -792,7 +843,9 @@ mod tests {
             mediator: Arc::new(mediator_on(Arc::clone(&store))),
             store,
             rate_limit: 0,
+            rate_limit_on_error: OnError::Closed,
             client_ip_header: None,
+            trusted_proxies: Arc::from(Config::default().trusted_proxies),
             public_url: "https://mediator.example.com".into(),
             sockets: Arc::new(Sockets::new(100)),
             stopping: tokio::sync::watch::channel(false).1,
@@ -980,13 +1033,11 @@ mod tests {
             let state = state.clone();
             async move {
                 router(state)
-                    .oneshot(
+                    .oneshot(from_proxy(
                         Request::post("/didcomm")
                             .header(header::CONTENT_TYPE, "application/json")
-                            .header("x-forwarded-for", format!("198.51.100.1, {ip}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
+                            .header("x-forwarded-for", format!("198.51.100.1, {ip}")),
+                    ))
                     .await
                     .unwrap()
                     .status()
@@ -1008,6 +1059,16 @@ mod tests {
         );
     }
 
+    /// A request as the proxy in front (Caddy on the Compose network) hands
+    /// it over.
+    fn from_proxy(request: axum::http::request::Builder) -> Request<Body> {
+        let peer: SocketAddr = "172.18.0.3:40000".parse().unwrap();
+        request
+            .extension(ConnectInfo(peer))
+            .body(Body::empty())
+            .unwrap()
+    }
+
     #[test]
     fn client_ip_prefers_the_proxy_header() {
         let mut headers = HeaderMap::new();
@@ -1015,22 +1076,106 @@ mod tests {
             "x-forwarded-for",
             HeaderValue::from_static("10.0.0.1, 192.0.2.7"),
         );
-        let name = HeaderName::from_static("x-forwarded-for");
+        let state = AppState {
+            client_ip_header: Some(HeaderName::from_static("x-forwarded-for")),
+            ..state()
+        };
         let peer = Some("127.0.0.1:5000".parse().unwrap());
         assert_eq!(
-            client_ip(&headers, Some(&name), peer),
+            client_ip(&headers, &state, peer),
             Some("192.0.2.7".parse().unwrap())
         );
+        let unset = AppState {
+            client_ip_header: None,
+            ..state.clone()
+        };
         assert_eq!(
-            client_ip(&headers, None, peer),
+            client_ip(&headers, &unset, peer),
             Some("127.0.0.1".parse().unwrap())
         );
         // A request without the header (one that did not come through the
         // proxy) is counted by its peer, not let through.
         assert_eq!(
-            client_ip(&HeaderMap::new(), Some(&name), peer),
+            client_ip(&HeaderMap::new(), &state, peer),
             Some("127.0.0.1".parse().unwrap())
         );
+        // A peer that is not a trusted proxy wrote the header itself.
+        let stranger = Some("203.0.113.50:5000".parse().unwrap());
+        assert_eq!(
+            client_ip(&headers, &state, stranger),
+            Some("203.0.113.50".parse().unwrap())
+        );
+        let nobody = AppState {
+            trusted_proxies: Arc::from(Vec::new()),
+            ..state.clone()
+        };
+        assert_eq!(
+            client_ip(&headers, &nobody, peer),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        // Nor is a header believed when the peer is unknown.
+        assert_eq!(client_ip(&headers, &state, None), None);
+    }
+
+    #[tokio::test]
+    async fn a_spoofed_header_from_outside_does_not_escape_the_rate_limit() {
+        let mut state = state();
+        state.rate_limit = 1;
+        state.client_ip_header = Some(HeaderName::from_static("x-forwarded-for"));
+        let send = |forwarded: String| {
+            let state = state.clone();
+            async move {
+                let peer: SocketAddr = "203.0.113.50:40000".parse().unwrap();
+                router(state)
+                    .oneshot(
+                        Request::post("/didcomm")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header("x-forwarded-for", forwarded)
+                            .extension(ConnectInfo(peer))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(
+            send("192.0.2.1".into()).await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            send("192.0.2.2".into()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_count_refuses_unless_open() {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .failing_hits
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let state = AppState {
+            store: store.clone() as Arc<dyn Store>,
+            rate_limit: 10,
+            ..state()
+        };
+        let send = |state: AppState| async move {
+            router(state)
+                .oneshot(from_proxy(
+                    Request::post("/didcomm").header(header::CONTENT_TYPE, "application/json"),
+                ))
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(send(state.clone()).await, StatusCode::SERVICE_UNAVAILABLE);
+        let open = AppState {
+            rate_limit_on_error: OnError::Open,
+            ..state
+        };
+        assert_eq!(send(open).await, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[test]

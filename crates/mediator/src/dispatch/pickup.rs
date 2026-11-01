@@ -93,11 +93,11 @@ pub async fn handle(
             match (wanted, session) {
                 (true, None) => Ok(Handled::Problem(Problem::LiveModeNotSupported)),
                 (true, Some(session)) => {
-                    mediator.live().enable(session, requester);
+                    mediator.go_live(session, requester).await;
                     status(mediator, requester, recipient, message, true).await
                 }
                 (false, Some(session)) => {
-                    mediator.live().disable(session);
+                    mediator.leave_live(session).await;
                     status(mediator, requester, recipient, message, false).await
                 }
                 (false, None) => status(mediator, requester, recipient, message, false).await,

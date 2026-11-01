@@ -19,7 +19,7 @@ Cargo workspace:
 - `crates/mediator/` — `almena-mediator`: the service.
   - `config` reads `ALMENA_*` env vars; `identity` holds the mediator's `did:web`, keys (`ALMENA_KEYS_PATH`) and DID document.
   - `store/`: the `Store` trait with Redis and in-memory implementations, and a contract test both must pass.
-  - `dispatch/`: unpacks what reaches `/didcomm` or `/ws` and dispatches — `protocols.rs` (Trust Ping, Discover Features, problem reports), `mediation.rs` (Coordinate Mediation, `forward`), `pickup.rs` (Message Pickup), `live.rs` (live-delivery sessions), `relay.rs` (forwarding to other mediators), `devices.rs` (push protocols: device registration), `turn.rs` (TURN 1.0, Almena's own: time-limited credentials for the coturn relay, nothing stored).
+  - `dispatch/`: unpacks what reaches `/didcomm` or `/ws` and dispatches — `protocols.rs` (Trust Ping, Discover Features, problem reports), `mediation.rs` (Coordinate Mediation, `forward`), `pickup.rs` (Message Pickup), `live.rs` (live-delivery sessions, shared across instances on Redis: presence and pub/sub, SPEC.md Appendix E), `relay.rs` (forwarding to other mediators: stored, then sent by a background worker), `devices.rs` (push protocols: device registration), `turn.rs` (TURN 1.0, Almena's own: time-limited credentials for the coturn relay, nothing stored).
   - `push/`: wake-ups and call rings through FCM (`fcm.rs`) and APNs (`apns.rs`, VoIP pushes too), coalescing, the `Pusher` trait.
   - `transport.rs`: outbound HTTPS with the SSRF guard, and the `did:web` / `did:webvh` resolver. `oob.rs`: the Out-of-Band invitation.
   - `routes` is the axum router: HTTP and WebSocket endpoints, rate limit, HTTP status mapping.

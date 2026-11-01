@@ -296,17 +296,20 @@ async fn queue_all(
         )
         .await?
         .ok_or(ReceiveError::QueueFull)?;
-    for (id, message) in ids.into_iter().zip(payloads) {
-        mediator.live().notify(
-            mediation,
-            &Queued {
-                id,
-                recipient: recipient.to_owned(),
-                received,
-                message,
-            },
-        );
+    let queued: Vec<Queued> = ids
+        .into_iter()
+        .zip(payloads)
+        .map(|(id, message)| Queued {
+            id,
+            recipient: recipient.to_owned(),
+            received,
+            message,
+        })
+        .collect();
+    for queued in &queued {
+        mediator.live().notify(mediation, queued);
     }
+    super::live::share(mediator.live(), mediator.store(), mediation, queued).await;
     Ok(())
 }
 

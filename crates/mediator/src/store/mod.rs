@@ -44,7 +44,7 @@ pub enum RemoveRecipient {
 }
 
 /// A queued message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Queued {
     pub id: String,
     pub recipient: String,
@@ -63,15 +63,18 @@ pub struct QueueSummary {
     pub total_bytes: u64,
 }
 
-/// A `forward` payload waiting to be relayed to another mediator again.
+/// A `forward` payload waiting to be relayed to another mediator.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingRelay {
     /// Stable for the same payload and destination.
     pub id: String,
     pub uri: String,
     pub message: String,
-    /// Retries already made.
-    pub retries: u32,
+    /// Attempts already made; 0 until the first. Relays stored before the
+    /// first attempt moved to the background counted retries, one fewer:
+    /// read as attempts, they get one more try.
+    #[serde(alias = "retries")]
+    pub attempts: u32,
 }
 
 impl PendingRelay {
@@ -87,6 +90,16 @@ impl PendingRelay {
     pub fn bytes(&self) -> u64 {
         self.message.len() as u64
     }
+}
+
+/// A message queued by one mediator instance for a mediation another
+/// instance may hold a live session of (SPEC.md, Appendix E).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveEvent {
+    /// The instance that queued it, which has pushed it to its own sessions.
+    pub instance: String,
+    pub mediation: String,
+    pub queued: Queued,
 }
 
 /// How many relays may wait for a retry, so that destinations that stay down
@@ -249,6 +262,27 @@ pub trait Store: Send + Sync {
     /// went out less than `interval_secs` ago. Independent of the wake-up
     /// turn of [`Store::claim_push`]; with an interval of 0 it always is.
     async fn claim_ring(&self, mediation: &str, now: u64, interval_secs: u64) -> Result<bool>;
+
+    /// `instance` holds a live session for `mediation` until `now + ttl_secs`,
+    /// unless it says so again or [`Store::clear_live`] is called.
+    async fn set_live(
+        &self,
+        mediation: &str,
+        instance: &str,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<()>;
+    /// `instance` holds no live session for `mediation` any more.
+    async fn clear_live(&self, mediation: &str, instance: &str) -> Result<()>;
+    /// The instances that hold a live session for `mediation` at `now`, sorted.
+    async fn live_instances(&self, mediation: &str, now: u64) -> Result<Vec<String>>;
+    /// Hands `event` to every instance listening ([`Store::subscribe_live`]).
+    async fn publish_live(&self, event: &LiveEvent) -> Result<()>;
+    /// The events every instance publishes, this one's too, from now on; the
+    /// subscription comes back by itself after the store drops it (what was
+    /// published meanwhile is missed, and still queued). `None` from a store
+    /// in the process, which only one instance can use.
+    fn subscribe_live(&self) -> Option<tokio::sync::mpsc::Receiver<LiveEvent>>;
 }
 
 /// Opens the store named by `url`: `memory://` for the in-process store,
@@ -579,7 +613,7 @@ pub(crate) mod contract {
             id: format!("relay-{tag}-{n}"),
             uri: format!("https://{tag}.example/didcomm"),
             message: format!("payload {n}"),
-            retries: n,
+            attempts: n,
         };
         let roomy = RelayLimits {
             pending: 1000,
@@ -619,7 +653,7 @@ pub(crate) mod contract {
         );
         // Rescheduled, and finished.
         let mut again = relay(1);
-        again.retries = 2;
+        again.attempts = 2;
         assert!(
             store
                 .schedule_relay(&again, far + 200, roomy)
@@ -779,6 +813,25 @@ pub(crate) mod contract {
         store.release_push(&r3, now, 60).await.unwrap();
         assert!(store.claim_push(&r3, now, 3600).await.unwrap());
 
+        // Live presence: per instance, until it lapses or is cleared.
+        assert!(store.live_instances(&m1, now).await.unwrap().is_empty());
+        store.set_live(&m1, "i2", now, 60).await.unwrap();
+        store.set_live(&m1, "i1", now, 30).await.unwrap();
+        assert_eq!(store.live_instances(&m1, now).await.unwrap(), ["i1", "i2"]);
+        assert_eq!(store.live_instances(&m1, now + 45).await.unwrap(), ["i2"]);
+        // Saying so again extends it.
+        store.set_live(&m1, "i1", now + 20, 60).await.unwrap();
+        assert_eq!(
+            store.live_instances(&m1, now + 45).await.unwrap(),
+            ["i1", "i2"]
+        );
+        store.clear_live(&m1, "i2").await.unwrap();
+        store.clear_live(&m1, "i9").await.unwrap();
+        assert_eq!(store.live_instances(&m1, now).await.unwrap(), ["i1"]);
+        assert!(store.live_instances(&m2, now).await.unwrap().is_empty());
+        store.clear_live(&m1, "i1").await.unwrap();
+        assert!(store.live_instances(&m1, now).await.unwrap().is_empty());
+
         // Rings: one per interval, whatever the wake-up turn says.
         assert!(store.claim_ring(&m1, now, 60).await.unwrap());
         assert!(!store.claim_ring(&m1, now + 59, 60).await.unwrap());
@@ -787,7 +840,7 @@ pub(crate) mod contract {
         assert!(store.claim_ring(&r3, now, 0).await.unwrap());
     }
 
-    fn uuid() -> String {
+    pub(crate) fn uuid() -> String {
         almena_didcomm::Message::new("t", serde_json::json!({})).id
     }
 }
@@ -800,6 +853,15 @@ pub(crate) fn now_for_tests() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relays_stored_with_retries_still_read() {
+        let old: PendingRelay = serde_json::from_str(
+            r#"{"id":"x","uri":"https://m.example/didcomm","message":"{}","retries":1}"#,
+        )
+        .unwrap();
+        assert_eq!(old.attempts, 1);
+    }
 
     #[test]
     fn queue_ids() {

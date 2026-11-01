@@ -1,6 +1,6 @@
 # Almena Mediator Specification
 
-Version: draft 1 (2026-10-03) · Status: describes `almena-mediator` as implemented (phases 1–6, Appendix I).
+Version: draft 1 (2026-11-01) · Status: describes `almena-mediator` as implemented (phases 1–7, Appendix I).
 
 This document specifies the Almena Mediator as a profile of, and a set of extensions to, [DIDComm Messaging v2.0][didcomm]. It does not restate DIDComm: wherever a behaviour is the one the referenced specification defines, it says so and points at it. What it does spell out is what Almena adds, restricts, interprets or leaves out.
 
@@ -90,7 +90,7 @@ As [Routing]: `forward` messages are anoncrypted, carry the inner message as an 
 
 A `forward` MAY carry Almena's `urgency` header (§6.4); its only value is `"call"`, set on every `forward` of a call offer. A mediator relaying a payload (§6.7) puts the header it received on every `forward` it wraps, so the recipient's mediator still sees it.
 
-A `forward` with several attachments is taken whole or not at all: they are all queued, or all routed before any is relayed; a full queue (`507`) or an attachment that cannot be routed (`404`) leaves nothing behind, so the sender's retry duplicates nothing.
+A `forward` with several attachments is taken whole or not at all: they are all queued, or all routed before any is relayed; a full queue (`507`), an attachment that cannot be routed (`404`) or a destination over its relay rate (`429`, §6.7) leaves nothing behind, so the sender's retry duplicates nothing.
 
 Not used: rewrapping, `delay_milli`.
 
@@ -262,7 +262,7 @@ The mediator publishes one [Out-of-Band 2.0][didcomm] invitation that never chan
 When a reply cannot go back on the connection (no `return_route`, or `none`), the mediator delivers it only if the request was authcrypted:
 
 1. If the sender is mediated here — a registered recipient DID, or a mediation DID, registered as a recipient or not — the reply is queued for it (live push or wake-up as usual), unwrapped.
-2. Otherwise it is wrapped for the sender's mediators and sent to its `DIDCommMessaging` service in the background, with the relay retries of §6.7.
+2. Otherwise it is wrapped for the sender's mediators and sent to its `DIDCommMessaging` service in the background, as a relay of §6.7 (its rate limit and retries); one over the rate is dropped.
 3. A sender with no service, or whose service names this mediator without being registered here, gets nothing.
 
 Replies to the mediator's own administrative messages are never wrapped for the wallet's mediators. Message Pickup answers (`status`, `delivery`) only travel back on the connection: queued, each would add to the queue it describes.
@@ -271,13 +271,14 @@ Replies to the mediator's own administrative messages are never wrapped for the 
 
 When a `forward`'s `next` is not registered here, the mediator routes the payload as a sender would: resolves `next`, wraps it for the hops of its `DIDCommMessaging` service, and POSTs it to the service URI. `ALMENA_FEDERATION=false` disables this (`404`).
 
-- The first attempt happens before the mediator answers the `forward`; the answer is `202` once routing succeeded, whatever the attempt's outcome.
-- Failed attempts are retried after 5 s, 30 s, 2 min and 10 min, then dropped. Retries survive restarts and are leased (60 s) so that several instances never send the same one; the due ones are tried at once, each bounded by the outbound timeout (15 s), so a round ends well within its lease. At most 1000 relays wait, 50 for one destination host and 128 MiB in all; beyond that a failed relay is dropped.
+- Routing (resolving `next`, wrapping) happens before the mediator answers the `forward`; sending does not. Once routed, the payloads are stored and the answer is `202`; a background worker makes the first attempt at once. No request waits on another mediator, however slowly it answers. A store that fails before they are stored is `503`.
+- Before they are stored, each destination host is held to `ALMENA_RELAY_RATE_LIMIT` relays per minute (fixed window, counted in the store, so across instances): over it the `forward` is `429` with `Retry-After`, and nothing is stored. Relayed replies (§6.6) count too. The per-client limit (§11) bounds each sender; this one bounds what all of them together can make the mediator send one host.
+- Failed attempts are retried after 5 s, 30 s, 2 min and 10 min, then dropped. Relays survive restarts and are leased (60 s) so that several instances never send the same one; at most 64 attempts are in flight at once, each bounded by the outbound timeout (15 s), well within its lease. At most 1000 relays wait, 50 for one destination host and 128 MiB in all; beyond that a new relay is dropped (still `202`: the sender cannot tell a relay that waits from one that will).
 - A route that leads back to this mediator without a registration is `404`, not a loop.
 
 ### 6.8 Outbound request guard
 
-Every outbound URL comes from a DID document, i.e. from strangers. Outbound HTTP (federation, `did:web`) MUST use `https`, MUST NOT target IP-literal hosts, and MUST NOT connect to private, loopback, link-local, CGNAT or documentation addresses — checked at connect time, so DNS rebinding cannot bypass it. A `307` is followed only to a URL that passes the same checks. A fetched DID document or `did:webvh` log weighs at most 1 MiB, and a DID that failed to resolve is not fetched again for 60 s. `ALMENA_OUTBOUND_ALLOW_INSECURE=true` lifts the guard for local multi-mediator setups only.
+Every outbound URL comes from a DID document, i.e. from strangers. Outbound HTTP (federation, `did:web`) MUST use `https`, MUST NOT target IP-literal hosts, and MUST NOT connect to private, loopback, link-local, CGNAT or documentation addresses — checked at connect time, so DNS rebinding cannot bypass it. A `307` is followed only to a URL that passes the same checks. A fetched DID document or `did:webvh` log weighs at most 1 MiB, a DID that failed to resolve is not fetched again for 60 s, and resolutions of one DID that miss the cache at the same time share one fetch. The cache keeps the 1000 DIDs used most recently. `ALMENA_OUTBOUND_ALLOW_INSECURE=true` lifts the guard for local multi-mediator setups only.
 
 ### 6.9 TURN credentials
 
@@ -342,15 +343,15 @@ Problem reports follow [DIDComm] §Problem Reports: they open a child thread of 
 | `404` | `forward` to an unknown recipient (federation off, or a route back here). |
 | `413` | Larger than `ALMENA_MAX_MESSAGE_BYTES`. |
 | `415` | Any other `Content-Type`. |
-| `429` | Over the per-IP rate limit; with `Retry-After`. |
-| `503` | Storage unavailable. |
+| `429` | Over the per-client rate limit, or a `forward` to a destination over its relay rate (§6.7); with `Retry-After`. |
+| `503` | Storage unavailable, also when the rate limit cannot be counted and `ALMENA_RATE_LIMIT_ON_ERROR` is `closed` (§11). |
 | `507` | The recipient's queue is full (messages or bytes), or the mediator's store is at its high water (§11). |
 
 ### 7.2 WebSocket
 
-`GET /ws` upgrades. One encrypted DIDComm message per frame (text or binary, up to `ALMENA_MAX_MESSAGE_BYTES`), both directions. `return_route` is implied on the socket. Every frame the client sends (text, binary, ping; not the pong to the mediator's ping) counts against the same per-client rate limit as `POST /didcomm`; exceeding it closes the socket with code `1008`. At most 16 sockets per client are open at once (more: `429`), and `ALMENA_MAX_SOCKETS` in all (more: `503`, with `Retry-After`). The mediator pings every 30 s and closes a socket it has heard nothing from, not even a pong, for 90 s.
+`GET /ws` upgrades. One encrypted DIDComm message per frame (text or binary, up to `ALMENA_MAX_MESSAGE_BYTES`), both directions. `return_route` is implied on the socket. Every frame the client sends (text, binary, ping; not the pong to the mediator's ping) counts against the same per-client rate limit as `POST /didcomm`; exceeding it closes the socket with code `1008`, and a frame the rate limit cannot count while it fails closed with `1013` (try again later). At most 16 sockets per client are open at once (more: `429`), and `ALMENA_MAX_SOCKETS` in all (more: `503`, with `Retry-After`). The mediator pings every 30 s and closes a socket it has heard nothing from, not even a pong, for 90 s.
 
-Live mode: the wallet sends an authcrypted `live-delivery-change` with `live_delivery: true` and is answered with `status` (`live_delivery: true`). From then on, each message queued for the mediation is pushed as a `delivery` with one attachment whose `id` is the queue id. Messages queued earlier are fetched with `delivery-request`. Live mode ends with the connection. A mediation is *online* while it has a live session; online mediations get no push.
+Live mode: the wallet sends an authcrypted `live-delivery-change` with `live_delivery: true` and is answered with `status` (`live_delivery: true`). From then on, each message queued for the mediation is pushed as a `delivery` with one attachment whose `id` is the queue id. Messages queued earlier are fetched with `delivery-request`. Live mode ends with the connection. A mediation is *online* while it has a live session on any of the mediator's instances (Appendix E); online mediations get no push.
 
 ### 7.3 Other endpoints
 
@@ -417,7 +418,9 @@ A mediator's physical resources are bounded, so besides the limits per mediation
 | `ALMENA_STORE_HIGH_WATER` | 90 % of Redis `maxmemory` | Sampled every 5 s. At it a new mediation gets `mediate-deny` and a new message `507`. Without `maxmemory` there is nothing to measure against and it is off. |
 | `ALMENA_MAX_SOCKETS` | 5 000 WebSockets in all | `503` with `Retry-After`. |
 | `ALMENA_MEDIATION_TTL` | 90 days | A mediation with no authenticated mediation, pickup or push message for this long is removed, with its DIDs, queue and devices. Asking for TURN credentials does not count. |
-| `ALMENA_RATE_LIMIT` | 60 / min / client | `429`, or WebSocket close `1008`. A client is an IPv4 address or an IPv6 /64. |
+| `ALMENA_RATE_LIMIT` | 60 / min / client | `429`, or WebSocket close `1008`. A client is an IPv4 address or an IPv6 /64: the TCP peer, or the address a trusted proxy names (App. G). |
+| `ALMENA_RATE_LIMIT_ON_ERROR` | `closed` | When the store cannot count a message: `closed` refuses it (`503`, WebSocket close `1013`), `open` lets it through. Either way it is logged and counted (App. H). |
+| `ALMENA_RELAY_RATE_LIMIT` | 600 / min / destination host; 0 = no limit | `429` on a `forward` to be relayed (§6.7). |
 | `ALMENA_PUSH_MIN_INTERVAL` | 60 s | §6.4. |
 | `ALMENA_PUSH_RING_INTERVAL` | 5 s | Least time between two call rings to one mediation (§6.4). |
 | `ALMENA_TURN_TTL` | 1 day | Lifetime of TURN credentials (§6.9). |
@@ -431,7 +434,8 @@ The full list is in [.env.example](.env.example).
 - **Push.** Payloads carry nothing linkable to a DID, a sender or a message (§6.4). Push providers learn only that a device is being woken, or rung for a call. The `urgency` header (§3.4) tells every mediator on the route that a message is a call, not from whom.
 - **Calls.** Media is DTLS-SRTP between the two wallets; the TURN server relays it without being able to read it. It sees both wallets' IP addresses and the timing and volume of their calls, as the mediator already sees their messages' — which is why each wallet uses its own mediator's TURN server. TURN is offered over UDP and TCP without TLS: a network observer can see that a wallet uses TURN, but not what it carries.
 - **Metrics.** Aggregate only — no DIDs, nothing per mediation — and served on a separate listener.
-- **Outbound requests.** Guarded against SSRF (§6.8); `links` attachments refused (D8).
+- **Outbound requests.** Guarded against SSRF (§6.8); `links` attachments refused (D8). Relays are sent in the background and held to a rate per destination host (§6.7), so the mediator is neither held up by nor turned against another host.
+- **Client addresses.** A proxy's client IP header is believed only from a trusted proxy's address (App. G); anyone else is counted by its own.
 - **Keys.** The mediator's private keys are its identity; rotation is immediate (§5.3).
 
 ## 13. Not specified / not implemented
@@ -440,7 +444,7 @@ The full list is in [.env.example](.env.example).
 - `forward` rewrapping, `delay_milli`, `links` attachments.
 - A push gateway for third-party mediators (§6.4).
 - TURN over TLS (`turns:`).
-- Live delivery across several mediator instances (sessions are per process).
+- Live delivery across instances on the in-memory store (`memory://` is one process).
 - Message content protocols, groups, directories, a mediator registry.
 
 
@@ -473,7 +477,9 @@ Items were either **decided** explicitly or are **proposed** defaults that stand
 | **Immediate key rotation**, no overlap | Rotation is mainly for a compromised key, which must stop working at once. | §5.3 |
 | **Redis** with AOF | Queues survive restarts. | App. D |
 | **One queue per mediation** | Queue ids unique across a wallet's DIDs. | §6.1 |
-| **One instance** for now | Live sessions are in process. | App. E |
+| **Several instances on one Redis** | Live sessions are per process; Redis pub/sub and a presence key carry them across instances. (2026-11-01) | App. E |
+| **Relays sent in the background**, rate-limited per destination | A `forward` from anyone must not hold a request handler on a stranger's server, nor make the mediator flood one host. (2026-11-01) | §6.7 |
+| **Client IP header from trusted proxies only**; the rate limit fails closed | A header anyone can write is no address; an uncountable request is not let through by default. (2026-11-01) | §11, App. G |
 | **Metrics on their own listener**, aggregate only | Never exposed through the public proxy; no DIDs. | App. H |
 | **TURN credentials from the mediator**, relay always | Calls never expose a wallet's IP to its contact; the operator who relays is the one the wallet already trusts; no second account. (2026-09-25) | §6.9 |
 | **Fixed Almena PIURIs** (`https://almena.id/protocols/…`) | No DIDComm protocol exists for this; a PIURI is a name compared as text, so it cannot vary per environment. (2026-09-25) | §6.9 |
@@ -521,7 +527,7 @@ Redis, a service in `compose.yml`, with AOF persistence (`appendonly yes`, `appe
 | `mediation:{M}:queue` | stream | One entry per queued message: recipient and size |
 | `mediation:{M}:msg:{id}` | string with TTL | The message itself |
 | `mediation:{M}:bytes` | counter with TTL | Bytes queued, kept in step by the enqueue, expiry and removal scripts |
-| `rate:{key}:{window}` | counter with TTL | Rate-limit hits (fixed window) |
+| `rate:{key}:{window}` | counter with TTL | Rate-limit hits (fixed window): `didcomm:{client}`, `relay:{host}` |
 | `push:{M}` | hash | Devices: service (`fcm`, `apns`, `apns-voip`) → `{token, platform}` as JSON |
 | `push-sent:{M}` | string with TTL | Time of the last push, until the wallet picks up |
 | `ring:{M}` | string with TTL | Time of the last call ring, for `ALMENA_PUSH_RING_INTERVAL` |
@@ -529,12 +535,19 @@ Redis, a service in `compose.yml`, with AOF persistence (`appendonly yes`, `appe
 | `relay:items` | hash | Relay id → `{uri, message, retries}` as JSON |
 | `relay:hosts` | hash | Destination host → relays waiting for it |
 | `relay:bytes` | counter | Size of the relays waiting |
+| `live:{M}` | sorted set with TTL | Instances with a live session for `M`, by when their word lapses (App. E) |
 
-Bodies live outside the stream so `status` reads only small entries. Registration and enqueueing are Lua scripts, so they are atomic. Expired entries are trimmed on every read and write (`XTRIM MINID`); bodies expire on their own. Expired mediations are swept hourly. A background worker takes due relays every second and leases them for 60 s.
+Bodies live outside the stream so `status` reads only small entries. Registration and enqueueing are Lua scripts, so they are atomic. Expired entries are trimmed on every read and write (`XTRIM MINID`); bodies expire on their own. Expired mediations are swept hourly. A background worker takes due relays as soon as one is stored, and every second, and leases them for 60 s. Live events travel on the pub/sub channel `live`.
 
 ## Appendix E. Scaling
 
-Live sessions are tracked in process (`dispatch/live.rs`), so the mediator runs as **one instance**. Behind a load balancer with several, a message queued by one instance would not be pushed live to a session on another (it would still be picked up), and that instance would send a needless push. When scaling out is needed: one Redis pub/sub channel every instance listens to and filters, plus a shared presence key with a TTL for the push check. Relay retries are already safe across instances (leases).
+Live sessions are held by the process that holds their socket (`dispatch/live.rs`). On Redis, several instances can serve the same mediator behind a load balancer (with the same keys, App. C), and live delivery works across them:
+
+- **Presence.** Each instance has a random name. While it holds a live session for a mediation, it says so in `live:{M}` (a sorted set: instance → when its word lapses, 60 s ahead), renewed every 20 s and taken back when its last session for `M` ends. An instance that dies stops counting within 60 s.
+- **Fan-out.** Every instance subscribes to one pub/sub channel, `live`. A message queued for a mediation is pushed to the instance's own live sessions and, when `live:{M}` names another instance, published as `{instance, mediation, queued}`; each instance passes what it hears from others to its sessions for that mediation and ignores the rest. A dropped subscription reconnects after 1 s; what was published meanwhile is missed, and still queued (D7).
+- **Push check.** A mediation is online when it is live on this instance or `live:{M}` names any instance: none of them pushes to its devices (§6.4). When the presence cannot be read, it counts as offline: a needless push is better than a missing one.
+
+Everything else is already shared through the store: queues, rate limits (counted in Redis), push coalescing, and relays (leased, so no two instances send the same one). The in-memory store (`memory://`) is one process and shares nothing. WebSocket caps (`ALMENA_MAX_SOCKETS`, 16 per client) are per instance.
 
 ## Appendix F. Push gateway (planned)
 
@@ -554,7 +567,8 @@ Settings beyond §11, all `ALMENA_*` environment variables (full list in [.env.e
 | `ALMENA_RECIPIENT_PROOF` | `required` | §6.2. |
 | `ALMENA_FEDERATION` | `true` | §6.7. |
 | `ALMENA_OUTBOUND_ALLOW_INSECURE` | `false` | §6.8. |
-| `ALMENA_CLIENT_IP_HEADER` | — | Behind a proxy: header with the client IP; its **last** value is used. Unset, or missing from a request: the TCP peer. |
+| `ALMENA_CLIENT_IP_HEADER` | — | Behind a proxy: header with the client IP; its **last** value is used, and only when the TCP peer is a trusted proxy. Unset, missing from a request, or sent by anyone else: the TCP peer. |
+| `ALMENA_TRUSTED_PROXIES` | loopback and private ranges | Comma-separated CIDRs (`127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7`): the peers whose client IP header is believed. Empty: none. |
 | `ALMENA_PUSH_MODE` | `off` | `off` or `direct`. |
 | `ALMENA_FCM_SERVICE_ACCOUNT` | — | Service account key (JSON) of the wallet app's Firebase project. |
 | `ALMENA_APNS_KEY_PATH`, `ALMENA_APNS_KEY_ID`, `ALMENA_APNS_TEAM_ID`, `ALMENA_APNS_TOPIC` | — | APNs `.p8` key, its id, the team id and the app's bundle id (VoIP pushes go to `<bundle id>.voip`); all four or none. |
@@ -567,7 +581,7 @@ The TURN server is coturn, a service of `compose.yml` under the `turn` profile (
 
 On `SIGTERM` the mediator stops taking connections, closes its WebSockets (`1001`) and gives requests in flight 20 s to finish before it stops anyway; Compose waits 30 s (`stop_grace_period`) before killing it.
 
-Under Compose the mediator's port is published on loopback only (`ALMENA_MEDIATOR_BIND`): the way in is Caddy, which sets `X-Forwarded-For`; reached directly, a client could write that header itself. Redis has a memory ceiling (`ALMENA_REDIS_MAXMEMORY`, 1 GB) with `noeviction`: at it writes fail and the mediator answers `503`, rather than queued messages disappearing. The mediator samples Redis's memory (`INFO memory`) and stops taking new mediations and messages at `ALMENA_STORE_HIGH_WATER` of that ceiling, so it is not reached in normal operation.
+Under Compose the mediator's port is published on loopback only (`ALMENA_MEDIATOR_BIND`): the way in is Caddy, which sets `X-Forwarded-For` and reaches the mediator from the Compose network's private range, a trusted proxy by default. A client that reaches the mediator from a public address is counted by that address whatever header it writes; with the port published on every interface, narrow `ALMENA_TRUSTED_PROXIES` to the proxy's network (Docker's port publishing can make outside clients appear from the bridge gateway). Redis has a memory ceiling (`ALMENA_REDIS_MAXMEMORY`, 1 GB) with `noeviction`: at it writes fail and the mediator answers `503`, rather than queued messages disappearing. The mediator samples Redis's memory (`INFO memory`) and stops taking new mediations and messages at `ALMENA_STORE_HIGH_WATER` of that ceiling, so it is not reached in normal operation.
 
 ## Appendix H. Metrics
 
@@ -578,13 +592,15 @@ Prometheus text format on `ALMENA_METRICS_ADDR`, hand-written counters. Aggregat
 | `almena_mediator_info` | `version` |
 | `almena_didcomm_messages_total` | `transport` (`http`, `websocket`), `outcome` (`accepted`, `reply`, `rejected`) |
 | `almena_rate_limited_total` | — |
-| `almena_forwards_total` | `result` (`queued`, `relayed`, `relay_scheduled`, `relay_dropped`, `refused`) |
-| `almena_relay_retries_total` | `result` (`delivered`, `rescheduled`, `abandoned`) |
+| `almena_rate_limit_failures_total` | `result` (`allowed`, `refused`): rate-limit checks the store failed, and what `ALMENA_RATE_LIMIT_ON_ERROR` made of them |
+| `almena_relay_rate_limited_total` | — (forwards refused by `ALMENA_RELAY_RATE_LIMIT`) |
+| `almena_forwards_total` | `result` (`queued`; `relayed` on the first attempt; `relay_scheduled`, first attempt failed and retried; `relay_dropped`, too many relays waiting; `refused`) |
+| `almena_relay_retries_total` | `result` (`delivered`, `rescheduled`, `abandoned`): attempts after the first |
 | `almena_pushes_total` | `service` (`fcm`, `apns`), `result` (`delivered`, `invalid_token`, `failed`) |
 | `almena_rings_total` | `service` (`fcm`, `apns`, `apns-voip`), `result` (as above); call pushes, `apns` being the wake-up an iPhone without a VoIP token gets |
 | `almena_didcomm_message_seconds` (histogram) | — (time from envelope to answer) |
 | `almena_websocket_connections` (gauge) | — |
-| `almena_live_sessions` (gauge) | — (WebSockets in live mode) |
+| `almena_live_sessions` (gauge) | — (WebSockets in live mode on this instance) |
 | `almena_messages_acknowledged_total` | — (with `almena_forwards_total{result="queued"}`, how the queues grow) |
 | `almena_store_errors_total` | — |
 | `almena_mediations_granted_total`, `almena_mediations_removed_total` | — |
@@ -602,6 +618,7 @@ Prometheus text format on `ALMENA_METRICS_ADDR`, hand-written counters. Aggregat
 4. ✅ **Live and network** — WebSocket and live delivery, Out-of-Band invitations, federation.
 5. ✅ **Push** — FCM and APNs protocols, token storage, coalesced wake-ups, direct mode. The push gateway (App. F) waits for third-party mediators.
 6. ✅ **Calls** — TURN credentials (§6.9) and coturn in `compose.yml`; calls marked on the `forward` ring the phone (§6.4).
+7. ✅ **Hardening and scaling** — relays sent in the background with a rate per destination (§6.7), the client IP header believed from trusted proxies only and the rate limit failing closed (§11, App. G), an LRU cache for `did:web` / `did:webvh` with concurrent misses coalesced, live delivery across instances (App. E).
 
 Each phase ends with `task check` green and this document updated.
 

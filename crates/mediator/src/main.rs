@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
         push_ring_interval_secs: config.push.ring_interval_secs,
         recipient_proof: config.recipient_proof,
         mediation_ttl_secs: config.mediation_ttl_secs,
+        relay_rate_limit: config.relay_rate_limit,
     };
     let transport: Option<Arc<dyn Transport>> = if config.federation {
         if config.outbound_allow_insecure {
@@ -96,7 +97,10 @@ async fn main() -> Result<()> {
             turn.ttl_secs,
         ));
     }
-    mediator.start_relay_retries();
+    mediator.start_relays();
+    if mediator.start_live_sharing() {
+        tracing::info!("live sessions shared with the other instances on this Redis");
+    }
     mediator.start_cleanup();
     mediator.start_capacity_watch();
     let did = mediator.identity().did.clone();
@@ -105,6 +109,8 @@ async fn main() -> Result<()> {
         mediator: Arc::new(mediator),
         store,
         rate_limit: config.rate_limit,
+        rate_limit_on_error: config.rate_limit_on_error,
+        trusted_proxies: Arc::from(config.trusted_proxies.clone()),
         public_url: config.public_url.clone(),
         client_ip_header: config
             .client_ip_header
@@ -129,9 +135,10 @@ async fn main() -> Result<()> {
         shutdown_signal().await;
         let _ = stop.send(true);
     });
-    // Requests in flight get SHUTDOWN_GRACE to finish (a relay's first
-    // attempts can take a while); then the process stops anyway, before the
-    // container runtime kills it (compose.yml's stop_grace_period is longer).
+    // Requests in flight get SHUTDOWN_GRACE to finish; then the process
+    // stops anyway, before the container runtime kills it (compose.yml's
+    // stop_grace_period is longer). Relays being sent are leased in the
+    // store: one cut short is tried again once its lease runs out.
     let deadline = async {
         let _ = stopping.wait_for(|stopping| *stopping).await;
         tokio::time::sleep(SHUTDOWN_GRACE).await;

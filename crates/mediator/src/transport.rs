@@ -20,6 +20,7 @@ use almena_didcomm::did::{DidDocument, DidResolver, webvh};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use tokio::sync::OnceCell;
 
 /// What the mediator needs from the network.
 #[async_trait]
@@ -223,14 +224,84 @@ pub fn is_public(ip: IpAddr) -> bool {
 /// [`Transport`], caching documents for a few minutes. The Almena registry's
 /// issuers, verifiers and tenants are `did:webvh`: they authcrypt to the
 /// mediator and are registered as recipients under that DID.
+///
+/// The cache keeps the [`WebResolver::CAPACITY`] DIDs used most recently;
+/// requests that miss on the same DID at the same time share one fetch.
 pub struct WebResolver {
     transport: Arc<dyn Transport>,
-    /// What each DID resolved to, or why it did not, and when.
-    cache: Mutex<HashMap<String, (Resolved, Instant)>>,
+    cache: Mutex<Cache>,
+    /// Fetches under way, by DID: whoever misses on one waits for it.
+    fetching: Mutex<HashMap<String, Arc<OnceCell<Resolved>>>>,
 }
 
 /// A DID's document, or why it could not be had.
-type Resolved = Result<DidDocument, String>;
+type Resolved = almena_didcomm::Result<DidDocument>;
+
+/// What each DID resolved to, or why it did not, and when; the least
+/// recently used goes first when it is full.
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<String, Cached>,
+    /// Bumped on every use: an entry's `used` orders it.
+    clock: u64,
+}
+
+struct Cached {
+    result: Resolved,
+    at: Instant,
+    used: u64,
+}
+
+impl Cached {
+    fn fresh(&self) -> bool {
+        let ttl = if self.result.is_ok() {
+            WebResolver::TTL
+        } else {
+            WebResolver::FAILURE_TTL
+        };
+        self.at.elapsed() < ttl
+    }
+}
+
+impl Cache {
+    fn get(&mut self, did: &str) -> Option<Resolved> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.get_mut(did)?;
+        if !entry.fresh() {
+            self.entries.remove(did);
+            return None;
+        }
+        entry.used = clock;
+        Some(entry.result.clone())
+    }
+
+    /// Keeps `result` for `did`; when full, expired entries go first, then
+    /// the one used longest ago.
+    fn put(&mut self, did: &str, result: Resolved, capacity: usize) {
+        if !self.entries.contains_key(did) && self.entries.len() >= capacity {
+            self.entries.retain(|_, entry| entry.fresh());
+            if self.entries.len() >= capacity
+                && let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.used)
+                    .map(|(did, _)| did.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.clock += 1;
+        self.entries.insert(
+            did.to_owned(),
+            Cached {
+                result,
+                at: Instant::now(),
+                used: self.clock,
+            },
+        );
+    }
+}
 
 impl WebResolver {
     const TTL: Duration = Duration::from_secs(300);
@@ -242,19 +313,41 @@ impl WebResolver {
     pub fn new(transport: Arc<dyn Transport>) -> Self {
         Self {
             transport,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
+            fetching: Mutex::new(HashMap::new()),
         }
     }
 
     fn cached(&self, did: &str) -> Option<Resolved> {
-        let cache = self.cache.lock().ok()?;
-        let (result, at) = cache.get(did)?;
-        let ttl = if result.is_ok() {
-            Self::TTL
-        } else {
-            Self::FAILURE_TTL
+        self.cache.lock().ok()?.get(did)
+    }
+
+    /// Fetches `did` once however many ask at the same time, and caches
+    /// what came of it.
+    async fn fetch_shared(&self, did: &str, web: bool) -> Resolved {
+        let cell = match self.fetching.lock() {
+            Ok(mut fetching) => Arc::clone(fetching.entry(did.to_owned()).or_default()),
+            // A poisoned map only loses the sharing.
+            Err(_) => Arc::new(OnceCell::new()),
         };
-        (at.elapsed() < ttl).then(|| result.clone())
+        let result = cell
+            .get_or_init(|| async {
+                let result = self.fetch(did, web).await;
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.put(did, result.clone(), Self::CAPACITY);
+                }
+                result
+            })
+            .await
+            .clone();
+        if let Ok(mut fetching) = self.fetching.lock()
+            && fetching
+                .get(did)
+                .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            fetching.remove(did);
+        }
+        result
     }
 
     async fn fetch(&self, did: &str, web: bool) -> almena_didcomm::Result<DidDocument> {
@@ -288,21 +381,10 @@ impl DidResolver for WebResolver {
         if !web && !did.starts_with("did:webvh:") {
             return Err(Error::DidNotFound(did.to_owned()));
         }
-        if let Some(cached) = self.cached(did) {
-            return cached.map_err(Error::Resolver);
+        match self.cached(did) {
+            Some(cached) => cached,
+            None => self.fetch_shared(did, web).await,
         }
-        let result = self.fetch(did, web).await;
-        if let Ok(mut cache) = self.cache.lock() {
-            if cache.len() >= Self::CAPACITY {
-                cache.clear();
-            }
-            let kept = result
-                .as_ref()
-                .map(Clone::clone)
-                .map_err(ToString::to_string);
-            cache.insert(did.to_owned(), (kept, Instant::now()));
-        }
-        result
     }
 }
 
@@ -380,6 +462,8 @@ mod tests {
                 "not found: {url}"
             );
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Long enough for concurrent misses to overlap.
+            tokio::time::sleep(Duration::from_millis(20)).await;
             Ok(REGISTRY_LOG.to_owned())
         }
 
@@ -414,5 +498,36 @@ mod tests {
             resolver.resolve("did:example:1").await,
             Err(almena_didcomm::Error::DidNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_on_one_did_share_a_fetch() {
+        let registry = Arc::new(Registry(0.into()));
+        let resolver = WebResolver::new(registry.clone());
+        let all =
+            futures_util::future::join_all((0..8).map(|_| resolver.resolve(REGISTRY_DID))).await;
+        assert!(
+            all.iter()
+                .all(|doc| doc.as_ref().unwrap().id == REGISTRY_DID)
+        );
+        assert_eq!(registry.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(resolver.fetching.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_cache_drops_the_least_recently_used() {
+        let failed = || Err(almena_didcomm::Error::Resolver("down".into()));
+        let mut cache = Cache::default();
+        cache.put("did:web:a", failed(), 2);
+        cache.put("did:web:b", failed(), 2);
+        // `a` used last: `b` is the one to go.
+        assert!(cache.get("did:web:a").is_some());
+        cache.put("did:web:c", failed(), 2);
+        assert!(cache.get("did:web:b").is_none());
+        assert!(cache.get("did:web:a").is_some());
+        assert!(cache.get("did:web:c").is_some());
+        // Replacing an entry evicts nothing.
+        cache.put("did:web:c", failed(), 2);
+        assert_eq!(cache.entries.len(), 2);
     }
 }

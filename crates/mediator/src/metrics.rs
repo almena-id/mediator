@@ -40,9 +40,9 @@ pub enum Forward {
     Queued,
     /// Relayed to another mediator on the first attempt.
     Relayed,
-    /// First relay attempt failed; stored for retries.
+    /// First relay attempt failed; rescheduled for retries.
     RelayScheduled,
-    /// First relay attempt failed and could not be stored.
+    /// To be relayed, but too many relays were waiting.
     RelayDropped,
     /// Refused: malformed, unknown recipient, or queue full.
     Refused,
@@ -124,6 +124,8 @@ pub struct Metrics {
     acknowledged: AtomicU64,
     websockets: AtomicI64,
     rate_limited: AtomicU64,
+    rate_limit_failures: [AtomicU64; 2],
+    relay_rate_limited: AtomicU64,
     forwards: [AtomicU64; 5],
     relay_retries: [AtomicU64; 3],
     pushes: [[AtomicU64; 3]; 3],
@@ -158,6 +160,8 @@ impl Metrics {
             acknowledged: AtomicU64::new(0),
             websockets: AtomicI64::new(0),
             rate_limited: AtomicU64::new(0),
+            rate_limit_failures: [const { AtomicU64::new(0) }; 2],
+            relay_rate_limited: AtomicU64::new(0),
             forwards: [const { AtomicU64::new(0) }; 5],
             relay_retries: [const { AtomicU64::new(0) }; 3],
             pushes: [const { [const { AtomicU64::new(0) }; 3] }; 3],
@@ -206,6 +210,17 @@ impl Metrics {
 
     pub fn rate_limited(&self) {
         inc(&self.rate_limited, 1);
+    }
+
+    /// The per-client rate limit could not be checked (the store failed),
+    /// and the request was let through (`allowed`) or refused.
+    pub fn rate_limit_failed(&self, allowed: bool) {
+        inc(&self.rate_limit_failures[usize::from(!allowed)], 1);
+    }
+
+    /// A `forward` refused by the per-destination relay rate limit.
+    pub fn relay_rate_limited(&self) {
+        inc(&self.relay_rate_limited, 1);
     }
 
     pub fn forward(&self, forward: Forward, count: u64) {
@@ -359,6 +374,32 @@ impl Metrics {
             "Requests and WebSocket messages refused by the per-IP rate limit.",
         );
         let _ = writeln!(out, "almena_rate_limited_total {}", get(&self.rate_limited));
+
+        family(
+            &mut out,
+            "almena_rate_limit_failures_total",
+            "counter",
+            "Per-IP rate-limit checks the store failed, by what was done (ALMENA_RATE_LIMIT_ON_ERROR).",
+        );
+        for (i, result) in ["allowed", "refused"].iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "almena_rate_limit_failures_total{{result=\"{result}\"}} {}",
+                get(&self.rate_limit_failures[i])
+            );
+        }
+
+        family(
+            &mut out,
+            "almena_relay_rate_limited_total",
+            "counter",
+            "Forwards refused by the per-destination relay rate limit.",
+        );
+        let _ = writeln!(
+            out,
+            "almena_relay_rate_limited_total {}",
+            get(&self.relay_rate_limited)
+        );
 
         family(
             &mut out,
@@ -585,6 +626,8 @@ mod tests {
         let metrics = Metrics::new();
         metrics.message(Transport::WebSocket, MessageOutcome::Reply);
         metrics.forward(Forward::Queued, 3);
+        metrics.rate_limit_failed(false);
+        metrics.relay_rate_limited();
         metrics.push(Service::Apns, Push::InvalidToken);
         metrics.ring(Service::ApnsVoip, Push::Delivered);
         metrics.live_session_opened();
@@ -609,6 +652,9 @@ mod tests {
             text.contains("almena_didcomm_messages_total{transport=\"http\",outcome=\"reply\"} 0")
         );
         assert!(text.contains("almena_forwards_total{result=\"queued\"} 3"));
+        assert!(text.contains("almena_rate_limit_failures_total{result=\"refused\"} 1"));
+        assert!(text.contains("almena_rate_limit_failures_total{result=\"allowed\"} 0"));
+        assert!(text.contains("almena_relay_rate_limited_total 1"));
         assert!(text.contains("almena_pushes_total{service=\"apns\",result=\"invalid_token\"} 1"));
         assert!(text.contains("almena_rings_total{service=\"apns-voip\",result=\"delivered\"} 1"));
         assert!(!text.contains("almena_pushes_total{service=\"apns-voip\""));

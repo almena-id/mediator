@@ -280,6 +280,7 @@ const LIMITS: Limits = Limits {
     push_ring_interval_secs: 5,
     recipient_proof: true,
     mediation_ttl_secs: 0,
+    relay_rate_limit: 0,
 };
 
 /// The mediator's key agreement key on `curve`, as a kid and Affinidi key.

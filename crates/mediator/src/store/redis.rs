@@ -19,6 +19,10 @@
 //! | `relay:items` | hash | Relay id → the pending relay, as JSON |
 //! | `relay:hosts` | hash | Destination host → relays waiting for it |
 //! | `relay:bytes` | string | Total size of the relays waiting |
+//! | `live:{M}` | sorted set | Instances with a live session for `M`, by when that lapses |
+//!
+//! Live events go out on the pub/sub channel `live` (one for all
+//! instances, each filtering what it hears).
 //!
 //! Bodies live outside the stream so that status queries read only the small
 //! entries. Multi-key updates run as Lua scripts, so they are atomic; every
@@ -34,8 +38,8 @@ use redis::aio::ConnectionManager;
 use redis::streams::StreamRangeReply;
 
 use super::{
-    AddRecipient, PendingRelay, QueueLimits, QueueSummary, Queued, RelayLimits, RemoveRecipient,
-    Store, StoreMemory, id_millis, is_queue_id,
+    AddRecipient, LiveEvent, PendingRelay, QueueLimits, QueueSummary, Queued, RelayLimits,
+    RemoveRecipient, Store, StoreMemory, id_millis, is_queue_id,
 };
 use crate::push::{Device, Service};
 
@@ -255,7 +259,17 @@ return relays
 
 pub struct RedisStore {
     conn: ConnectionManager,
+    /// For the pub/sub connection, which is a connection of its own.
+    client: redis::Client,
 }
+
+/// The pub/sub channel of live events.
+const LIVE_CHANNEL: &str = "live";
+/// Live events waiting for the mediator to pass them on; beyond that the
+/// subscription waits (Redis buffers for it).
+const LIVE_BUFFER: usize = 1024;
+/// How long a dropped subscription waits before connecting again.
+const LIVE_RECONNECT: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl RedisStore {
     /// Connects to `url`. Fails if Redis cannot be reached at start-up.
@@ -277,10 +291,10 @@ impl RedisStore {
         };
         let client =
             redis::Client::open(url).with_context(|| format!("invalid Redis URL {shown}"))?;
-        let conn = ConnectionManager::new(client)
+        let conn = ConnectionManager::new(client.clone())
             .await
             .with_context(|| format!("connecting to Redis at {shown}"))?;
-        Ok(Self { conn })
+        Ok(Self { conn, client })
     }
 
     fn conn(&self) -> ConnectionManager {
@@ -349,6 +363,44 @@ fn push_sent_key(mediation: &str) -> String {
 
 fn ring_key(mediation: &str) -> String {
     format!("ring:{mediation}")
+}
+
+fn live_key(mediation: &str) -> String {
+    format!("live:{mediation}")
+}
+
+/// Listens on [`LIVE_CHANNEL`] and passes what it hears to `events`, until
+/// nobody reads them; connects again whenever the connection drops.
+async fn listen_live(client: redis::Client, events: tokio::sync::mpsc::Sender<LiveEvent>) {
+    use futures_util::StreamExt;
+    loop {
+        match client.get_async_pubsub().await {
+            Ok(mut pubsub) => match pubsub.subscribe(LIVE_CHANNEL).await {
+                Ok(()) => {
+                    tracing::debug!("listening for live events");
+                    let mut messages = pubsub.into_on_message();
+                    while let Some(message) = messages.next().await {
+                        match serde_json::from_slice::<LiveEvent>(message.get_payload_bytes()) {
+                            Ok(event) => {
+                                if events.send(event).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => tracing::warn!(error = %err, "unreadable live event"),
+                        }
+                    }
+                    tracing::warn!("live events subscription dropped, reconnecting");
+                }
+                Err(err) => tracing::warn!(error = %err, "cannot subscribe to live events"),
+            },
+            Err(err) => tracing::warn!(error = %err, "cannot connect for live events"),
+        }
+        if events.is_closed() {
+            return;
+        }
+        crate::metrics::METRICS.store_error();
+        tokio::time::sleep(LIVE_RECONNECT).await;
+    }
 }
 
 /// Stream id below which entries are older than the TTL.
@@ -762,6 +814,55 @@ impl Store for RedisStore {
             .await?;
         Ok(reply.is_some())
     }
+
+    async fn set_live(
+        &self,
+        mediation: &str,
+        instance: &str,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<()> {
+        let key = live_key(mediation);
+        let () = redis::pipe()
+            .atomic()
+            .zrembyscore(&key, "-inf", now)
+            .ignore()
+            .zadd(&key, instance, now + ttl_secs)
+            .ignore()
+            .expire(&key, i64::try_from(ttl_secs).unwrap_or(i64::MAX))
+            .ignore()
+            .query_async(&mut self.conn())
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_live(&self, mediation: &str, instance: &str) -> Result<()> {
+        let _: i64 = self.conn().zrem(live_key(mediation), instance).await?;
+        Ok(())
+    }
+
+    async fn live_instances(&self, mediation: &str, now: u64) -> Result<Vec<String>> {
+        let mut instances: Vec<String> = self
+            .conn()
+            .zrangebyscore(live_key(mediation), format!("({now}"), "+inf")
+            .await?;
+        instances.sort();
+        Ok(instances)
+    }
+
+    async fn publish_live(&self, event: &LiveEvent) -> Result<()> {
+        let _: i64 = self
+            .conn()
+            .publish(LIVE_CHANNEL, serde_json::to_string(event)?)
+            .await?;
+        Ok(())
+    }
+
+    fn subscribe_live(&self) -> Option<tokio::sync::mpsc::Receiver<LiveEvent>> {
+        let (events, received) = tokio::sync::mpsc::channel(LIVE_BUFFER);
+        tokio::spawn(listen_live(self.client.clone(), events));
+        Some(received)
+    }
 }
 
 #[cfg(test)]
@@ -783,5 +884,56 @@ mod tests {
             .await
             .unwrap();
         super::super::contract::run(&store).await;
+    }
+
+    /// Live events reach every subscriber, the publisher's own too.
+    #[tokio::test]
+    async fn live_events_reach_every_instance() {
+        let Ok(url) = std::env::var("ALMENA_TEST_REDIS_URL") else {
+            eprintln!("ALMENA_TEST_REDIS_URL not set; skipping the Redis live events test");
+            return;
+        };
+        let password = std::env::var("ALMENA_REDIS_PASSWORD")
+            .ok()
+            .filter(|p| !p.is_empty());
+        let a = RedisStore::connect(&url, password.as_deref())
+            .await
+            .unwrap();
+        let b = RedisStore::connect(&url, password.as_deref())
+            .await
+            .unwrap();
+        let mut heard_a = a.subscribe_live().unwrap();
+        let mut heard_b = b.subscribe_live().unwrap();
+        let event = LiveEvent {
+            instance: "a".into(),
+            mediation: format!("did:peer:live-{}", super::super::contract::uuid()),
+            queued: super::super::Queued {
+                id: "1-0".into(),
+                recipient: "did:peer:r".into(),
+                received: 1,
+                message: "{}".into(),
+            },
+        };
+        // The subscriptions connect in the background: publish until heard.
+        let heard = async {
+            loop {
+                a.publish_live(&event).await.unwrap();
+                if let Ok(Some(got)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), heard_b.recv())
+                        .await
+                {
+                    break got;
+                }
+            }
+        };
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), heard)
+            .await
+            .unwrap();
+        assert_eq!(got, event);
+        let own = tokio::time::timeout(std::time::Duration::from_secs(5), heard_a.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(own, event);
     }
 }
