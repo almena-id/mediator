@@ -14,7 +14,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [dependencies]
-aes = "0.9.3"
+aes = "0.9.4"
 aes-gcm = "0.11.1"
 aes-kw = "0.3.1"
 async-trait = "0.1.92"
@@ -30,15 +30,15 @@ p256 = { version = "0.14.0", features = ["ecdh", "ecdsa"] }
 p384 = { version = "0.14.0", features = ["ecdh"] }
 p521 = { version = "0.14.0", features = ["ecdh"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["preserve_order"] }
-sha2 = "0.11.0"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
 subtle = "2.6.1"
-thiserror = "2.0.20"
-uuid = { version = "1.26.1", features = ["v4"] }
+thiserror = "2.0.21"
+uuid = { version = "1.29.2", features = ["v4"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
-zeroize = "1.9.0"
+zeroize = "1.9.1"
 
 [dev-dependencies]
 base64 = "0.23.1"
-serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "rt"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["macros", "rt"] }

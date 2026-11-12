@@ -9,35 +9,35 @@ importers:
   .:
     dependencies:
       '@veramo/core':
-        specifier: ^7.0.1
-        version: 7.0.1
+        specifier: ^7.0.2
+        version: 7.0.2
       '@veramo/did-comm':
-        specifier: ^7.0.1
-        version: 7.0.1
+        specifier: ^7.0.2
+        version: 7.0.2
       '@veramo/did-manager':
-        specifier: ^7.0.1
-        version: 7.0.1
+        specifier: ^7.0.2
+        version: 7.0.2
       '@veramo/did-provider-peer':
-        specifier: ^7.0.1
-        version: 7.0.1
+        specifier: ^7.0.2
+        version: 7.0.2
       '@veramo/did-resolver':
-        specifier: ^7.0.1
-        version: 7.0.1
+        specifier: ^7.0.2
+        version: 7.0.2
       '@veramo/key-manager':
-        specifier: ^7.0.1
-        version: 7.0.1
+        specifier: ^7.0.2
+        version: 7.0.2
       '@veramo/kms-local':
-        specifier: ^7.0.1
-        version: 7.0.1
+        specifier: ^7.0.2
+        version: 7.0.2
       '@veramo/message-handler':
-        specifier: ^7.0.1
-        version: 7.0.1
+        specifier: ^7.0.2
+        version: 7.0.2
       did-resolver:
         specifier: ^6.0.0
         version: 6.0.0
       web-did-resolver:
-        specifier: ^2.0.32
-        version: 2.0.32
+        specifier: ^3.2.0
+        version: 3.2.0
 
 packages:
 
@@ -147,44 +147,44 @@ packages:
   '@types/node@22.7.5':
     resolution: {integrity: sha512-jML7s2NAzMWc//QSJ1a3prpk78cOPchGvXJsC3C6R6PSMoooztvRVQEz89gmBTBY1SPMaqo5teB4uNHPdetShQ==}
 
-  '@veramo/core-types@7.0.1':
-    resolution: {integrity: sha512-lL2znhERpLDMMvBC4nSipHMjUOeRcXp+b25ELWFb9GB78IDfoqUikSzzVPN61KQXaIIemtoWfAIJeJMFoiH4FA==}
+  '@veramo/core-types@7.0.2':
+    resolution: {integrity: sha512-v6l3oF7ptdlT6MJ8ldnRkSq09fvszhHfkp6PxOPmNpkahur9Tav3oRMr4EmlEO/EyCHItvTQJmxiT84xBxo5Ig==}
 
-  '@veramo/core@7.0.1':
-    resolution: {integrity: sha512-zr/1t7ukjZ4dFcXX09y5vTDZDFriXQ9hYLjkyaMuwEv2WrH5C2vCKgy817/lwN1tAuFOga95Eta3X3aN+xIOnw==}
+  '@veramo/core@7.0.2':
+    resolution: {integrity: sha512-Oi/Wo7KOVSzKqCnTLb1C9dmtC+Z3E/xSzbFLVc7vUx7vEm8gsiXF/GbLgrYxMgzW0o+AUdn5ZmlDEn34RwbPJA==}
 
-  '@veramo/did-comm@7.0.1':
-    resolution: {integrity: sha512-juLEWhw/6I1a9nS4RMw27GwQIhktMHAYCfwWhR290/UjdIpmlCLR/mOp16+D/UstVExHjv8FqNlQl1kAtb66wg==}
+  '@veramo/did-comm@7.0.2':
+    resolution: {integrity: sha512-X4iCsCuJ+wp0mZMD/TNaz7lcwGYdWgsDB0qiZmn+gyxPbYHJflYlTiqy7Rb/14kXk8rpVAn+pnef9jOQYwABtA==}
 
-  '@veramo/did-discovery@7.0.1':
-    resolution: {integrity: sha512-UPEEgtmVSsYcQo/Ysly1que9DrjjRCfqy4dRyYPXK2Iyy6IoI1UX8lP8/32nzrk3CCBPV+MR3iZ11pydMwdT9A==}
+  '@veramo/did-discovery@7.0.2':
+    resolution: {integrity: sha512-YetJBB0s0LCL9PXaLOWbudCagBfVUE+vRyU21/KJZf5mrGpy3nOnGt1e8+ujHDA2N1sJRLMhjbEvuczckqGjGQ==}
 
-  '@veramo/did-manager@7.0.1':
-    resolution: {integrity: sha512-ycEN8Yda89tHpUTjp1ewUFynwTisgYrFpmsaYJpA8ypNcN+VukrS9hIYb42hUHiJWf4/ylnp3XwIwt1QdPT5ag==}
+  '@veramo/did-manager@7.0.2':
+    resolution: {integrity: sha512-CRoKTzIgE2+FowrjDPC6FMsM/1rCtEHR84SAPgB35FJdPkyYe5TbSt9PBXz4i2bJ2sdbhS3NTc2bmrFYFwaiVA==}
 
-  '@veramo/did-provider-peer@7.0.1':
-    resolution: {integrity: sha512-v4uxiQJsYfpAk+7hWJBlf6gc2JzA9zQ+PgyUfSYy0lbomjHlDA5bhvIenGuIP60G9zYmXUYvC0cioElVfGotig==}
+  '@veramo/did-provider-peer@7.0.2':
+    resolution: {integrity: sha512-51hw0PNNz7uoEvCHu8M7WNlFcSZMMqceXDqYmaqfIQEJ1BAUuYRoGlcCfm//iLy4tteXVhIuc1wzcnHNKZtchQ==}
 
-  '@veramo/did-resolver@7.0.1':
-    resolution: {integrity: sha512-QFG+43yo4eWkrGsa3VPwg4VuhGFmBEek4vTbyw1+PGE2SVq/NQebObTrbVkmTxIc23O2OdW/e4d9OyuUMmwPuQ==}
+  '@veramo/did-resolver@7.0.2':
+    resolution: {integrity: sha512-/Pdpv21QU2KFS20BXtYTnBldz78UU53+cCO805RPqvmr+9AU+Fr7k3lZBfyVKj3TmDxlLlsJIuQKJ8Vy1rrfPQ==}
 
-  '@veramo/key-manager@7.0.1':
-    resolution: {integrity: sha512-NQd6iDhgIOqpEj6K5hFwI7RBE8KGosxmfTVwO8deIxBemzuMx9VAKOYc6IdMydQvnT+ueostnMHmBfwkiAX/lg==}
+  '@veramo/key-manager@7.0.2':
+    resolution: {integrity: sha512-iNHyjmu/Q+GxiIsXLsbxLYO7SIoswGV8++EgmipFSdmnXCoiAqgAcGuCeNLap+bxBMPch5uPciW0AhVN9vKI1Q==}
 
-  '@veramo/kms-local@7.0.1':
-    resolution: {integrity: sha512-CrDWt6bIeBHAOliUqziBGmwtGcCZMb2iqJ3lwgLawRM+GceNw0ob69YxPpY24sIzeXYMAqpyQ/KM4mgQT4qZIg==}
+  '@veramo/kms-local@7.0.2':
+    resolution: {integrity: sha512-BFJcWmLmrox9ZeKHptOeIXByesNnZR9YBjzBXWVAQtBQ682nD/erm56vLrjqabDFVb9z2AYHBDp4kKMuQRjcnA==}
 
-  '@veramo/kv-store@7.0.1':
-    resolution: {integrity: sha512-znX1eMedel8clsTuT0DD8/t3aQbwjs6ATq/YwDHgM0xLR3gLXxO1X7tS/nXiBh/qar2q8Jb3CxQrsA/wbf/vAw==}
+  '@veramo/kv-store@7.0.2':
+    resolution: {integrity: sha512-T4bY7u0D+6h0izH4DzSPjmCq9kw7YTk4Rd0Irg+tQNxutPah4S3VgEygayUcquwvYi33YLLyX9rw5n7CLV0eNQ==}
 
-  '@veramo/mediation-manager@7.0.1':
-    resolution: {integrity: sha512-s9SDLAyph2YmSkHq9QYMRWouI9Ok/0Qo2phiCaFJpQO+lWv6Fvdt6ebIUnQ1wICMoiwRl6E9u4mErreVQBBqzQ==}
+  '@veramo/mediation-manager@7.0.2':
+    resolution: {integrity: sha512-2vVMexBSnUcECIpUiWezBcU5s4tamtc1yHrGCOvEWgc8dPiBfc7I+CRpAT6pMXhGA//5/PAj/mcCfvxzYN09Hg==}
 
-  '@veramo/message-handler@7.0.1':
-    resolution: {integrity: sha512-hCLKkfAnBKPUqSyVKAknejq4Vcc4BYYFGkAWhz+mPiDN/zWlNLikrq1f8fFVw/BbG4fH4qCnDGZBASRS83vLcQ==}
+  '@veramo/message-handler@7.0.2':
+    resolution: {integrity: sha512-7ZrNjDJgW2kfAmphjkqyJwO01vAHLGiGPDOFBtsclxCrHLjEPhBWS1EQfcgdqWiQcEQdOIRBu7fG/pg5k+CrMQ==}
 
-  '@veramo/utils@7.0.1':
-    resolution: {integrity: sha512-/WxmFrtqaVZ4SzreftjP+aKaHHqUI8RtfEdW4H7XHlyUNqWD6Zjsjme+1vk1S0i0RDHzGGJxGk2gLbIDzO0Ovw==}
+  '@veramo/utils@7.0.2':
+    resolution: {integrity: sha512-+PdQ4IqcpZrLyujFoaEYxcx8+luQ7BpQ02cCY4ZFNbg/WOqAsfZp3kP83HvfiI65sdiiydLnjFb5wzqsA9DoTw==}
 
   aes-js@4.0.0-beta.5:
     resolution: {integrity: sha512-G965FqalsNyrPqgEGON7nIx1e/OVENSgiEIzyC63haUMuvNnwIgIjMs52hlTCKhkBny7A2ORNlfY9Zu+jmGk1Q==}
@@ -193,8 +193,8 @@ packages:
     resolution: {integrity: sha512-quJQXlTSUGL2LH9SUXo8VwsY4soanhgo6LNSm84E1LBcE8s3O0wpdiRzyR9z/ZZJMlMWv37qOOb9pdJlMUEKFQ==}
     engines: {node: '>=8'}
 
-  ansi-regex@6.3.0:
-    resolution: {integrity: sha512-WpDfL7NO6j7tH88IDBNVdUJxDh9nmCteAVW9dsep846XdwF4naCBK+/tGLX3KJgcpgMRXCFlTM2hKGoK9FsdrQ==}
+  ansi-regex@6.6.0:
+    resolution: {integrity: sha512-XZ5apbzreCbXSKwPjJstu8R0zOi247w3XYwWxtwBXgpZrCyc1Ka7p9/xY0A9/diMewmHbEKz+FIraWaEWjlN5g==}
     engines: {node: '>=12'}
 
   ansi-styles@4.3.0:
@@ -205,8 +205,8 @@ packages:
     resolution: {integrity: sha512-4Dj6M28JB+oAH8kFkTLUo+a2jwOFkuqb3yucU0CANcRRUbxS0cP0nZYCGjcc3BNXwRIsUVmDGgzawme7zvJHvg==}
     engines: {node: '>=12'}
 
-  ansis@4.4.0:
-    resolution: {integrity: sha512-9k3v7xcHwgdO/DruxGIg4HtjvlAZlcnsX/mzqUb1t3NkYnl9kK2UJ+Gq0io+vQf7iT//BD/HB/NBkUR1LWxoeA==}
+  ansis@4.5.0:
+    resolution: {integrity: sha512-KwIVkfFfJSSzBmZhDGuTmkhWqTdyB5oNVzzznBJbBZ5bZtHiqSrcugRF0RKJKT4Ss3d7ZrcjnlFVDlQNmtWfWw==}
     engines: {node: '>=14'}
 
   app-root-path@3.1.0:
@@ -223,8 +223,8 @@ packages:
   base64-js@1.5.1:
     resolution: {integrity: sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==}
 
-  brace-expansion@2.1.7:
-    resolution: {integrity: sha512-uZbew1NqdmPDTMJ8ah1y+b+9QEJrfkXFk3RcTQw3X0jW/xRUvFKsg1CfQdSYGdTbXZWExtU3J3ccxtnfw1Fi0g==}
+  brace-expansion@2.1.8:
+    resolution: {integrity: sha512-BnlDzDYQoplTsZSvPi86CNzmbcb07X8ufR8fk1zivaiEJlXJkiq1MQyDCVmlWcsWbj6aWXqHnrwwevbrm/Saig==}
 
   buffer@6.0.3:
     resolution: {integrity: sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==}
@@ -560,8 +560,8 @@ packages:
   tslib@2.7.0:
     resolution: {integrity: sha512-gLXCKdN1/j47AiHiOkJN69hJmcbGTHI0ImLmbYLHykhgeN0jVGola9yVjFgzCUklsZQMW55o+dW7IXv3RCXDzA==}
 
-  tslib@2.8.1:
-    resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
+  tslib@2.9.1:
+    resolution: {integrity: sha512-a4Ux9VKuIMHsOS7ENbEq6hK2ZGYIT27Rtl0E4eD9KqwxhKiQeMZE/9xb3IdYwWaSOyIBQLExhQgXDTYoiCxnWA==}
 
   typed-array-buffer@1.0.3:
     resolution: {integrity: sha512-nAYYwfY3qnzX30IkA6AQZjVbtK6duGontcQm1WSG1MD94YLqK0515GNApXkoxKOWMusVssAHWLh9SeaoefYFGw==}
@@ -648,8 +648,9 @@ packages:
     resolution: {integrity: sha512-TQ5pAGhd5whStmqWvYF4OjQROlmv9SMFVt37qoCBdqRffuuklWYQlCNnEs2ZaIBD1kZRNnikiZOS1eqgkar0iw==}
     engines: {node: '>= 0.10'}
 
-  web-did-resolver@2.0.32:
-    resolution: {integrity: sha512-L91/ApTmDjgzS0UDstTKn3kN/1hlQBnVcUN8K29e3xhVBpPktHYC6uvVAQ8ohbIg9D6wrrbaBQvfRArDxgJG2g==}
+  web-did-resolver@3.2.0:
+    resolution: {integrity: sha512-DclShDbyFGnUuk17Is+hdBPsBbQRiZfcp6sEBS+4y8DeYN+sXnxYJPpdcgbLoNZHGYNoj12MR7MgO/j4VUrdFw==}
+    engines: {node: '>=22'}
 
   webidl-conversions@3.0.1:
     resolution: {integrity: sha512-2JAn3z8AR6rjK8Sm8orRC0h/bcl/DqL7tRPdGZ4I1CjdF+EaMLmYxBHyXuKL849eucPFhvBoxMsflfOb8kxaeQ==}
@@ -829,34 +830,33 @@ snapshots:
     dependencies:
       undici-types: 6.19.8
 
-  '@veramo/core-types@7.0.1':
+  '@veramo/core-types@7.0.2':
     dependencies:
-      credential-status: 3.0.4
       debug: 4.4.3
       did-jwt-vc: 4.0.16
       did-resolver: 4.1.0
     transitivePeerDependencies:
       - supports-color
 
-  '@veramo/core@7.0.1':
+  '@veramo/core@7.0.2':
     dependencies:
-      '@veramo/core-types': 7.0.1
+      '@veramo/core-types': 7.0.2
       debug: 4.4.3
       events: 3.3.0
       z-schema: 6.0.2
     transitivePeerDependencies:
       - supports-color
 
-  '@veramo/did-comm@7.0.1':
+  '@veramo/did-comm@7.0.2':
     dependencies:
       '@noble/ciphers': 1.3.0
       '@noble/curves': 1.9.7
       '@stablelib/aes-kw': 2.0.1
-      '@veramo/core-types': 7.0.1
-      '@veramo/kv-store': 7.0.1
-      '@veramo/mediation-manager': 7.0.1
-      '@veramo/message-handler': 7.0.1
-      '@veramo/utils': 7.0.1
+      '@veramo/core-types': 7.0.2
+      '@veramo/kv-store': 7.0.2
+      '@veramo/mediation-manager': 7.0.2
+      '@veramo/message-handler': 7.0.2
+      '@veramo/utils': 7.0.2
       cross-fetch: 4.1.0
       debug: 4.4.3
       did-jwt: 8.0.18
@@ -885,26 +885,26 @@ snapshots:
       - typeorm-aurora-data-api-driver
       - utf-8-validate
 
-  '@veramo/did-discovery@7.0.1':
+  '@veramo/did-discovery@7.0.2':
     dependencies:
-      '@veramo/core-types': 7.0.1
+      '@veramo/core-types': 7.0.2
       debug: 4.4.3
     transitivePeerDependencies:
       - supports-color
 
-  '@veramo/did-manager@7.0.1':
+  '@veramo/did-manager@7.0.2':
     dependencies:
-      '@veramo/core-types': 7.0.1
-      '@veramo/did-discovery': 7.0.1
+      '@veramo/core-types': 7.0.2
+      '@veramo/did-discovery': 7.0.2
     transitivePeerDependencies:
       - supports-color
 
-  '@veramo/did-provider-peer@7.0.1':
+  '@veramo/did-provider-peer@7.0.2':
     dependencies:
       '@aviarytech/did-peer': 0.0.22
-      '@veramo/core-types': 7.0.1
-      '@veramo/did-manager': 7.0.1
-      '@veramo/utils': 7.0.1
+      '@veramo/core-types': 7.0.2
+      '@veramo/did-manager': 7.0.2
+      '@veramo/utils': 7.0.2
       debug: 4.4.3
       did-resolver: 4.1.0
     transitivePeerDependencies:
@@ -913,10 +913,10 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@veramo/did-resolver@7.0.1':
+  '@veramo/did-resolver@7.0.2':
     dependencies:
-      '@veramo/core-types': 7.0.1
-      '@veramo/utils': 7.0.1
+      '@veramo/core-types': 7.0.2
+      '@veramo/utils': 7.0.2
       cross-fetch: 4.1.0
       debug: 4.4.3
       did-resolver: 4.1.0
@@ -926,11 +926,11 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@veramo/key-manager@7.0.1':
+  '@veramo/key-manager@7.0.2':
     dependencies:
       '@noble/curves': 1.9.7
-      '@veramo/core-types': 7.0.1
-      '@veramo/utils': 7.0.1
+      '@veramo/core-types': 7.0.2
+      '@veramo/utils': 7.0.2
       debug: 4.4.3
       did-jwt: 8.0.18
       ethers: 6.17.0
@@ -942,13 +942,13 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@veramo/kms-local@7.0.1':
+  '@veramo/kms-local@7.0.2':
     dependencies:
       '@noble/curves': 1.9.7
       '@stablelib/nacl': 1.0.4
-      '@veramo/core-types': 7.0.1
-      '@veramo/key-manager': 7.0.1
-      '@veramo/utils': 7.0.1
+      '@veramo/core-types': 7.0.2
+      '@veramo/key-manager': 7.0.2
+      '@veramo/utils': 7.0.2
       debug: 4.4.3
       did-jwt: 8.0.18
       ethers: 6.17.0
@@ -958,10 +958,10 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@veramo/kv-store@7.0.1':
+  '@veramo/kv-store@7.0.2':
     dependencies:
-      '@veramo/core-types': 7.0.1
-      '@veramo/utils': 7.0.1
+      '@veramo/core-types': 7.0.2
+      '@veramo/utils': 7.0.2
       debug: 4.4.3
       events: 3.3.0
       json-buffer: 3.0.1
@@ -990,10 +990,10 @@ snapshots:
       - typeorm-aurora-data-api-driver
       - utf-8-validate
 
-  '@veramo/mediation-manager@7.0.1':
+  '@veramo/mediation-manager@7.0.2':
     dependencies:
-      '@veramo/core-types': 7.0.1
-      '@veramo/kv-store': 7.0.1
+      '@veramo/core-types': 7.0.2
+      '@veramo/kv-store': 7.0.2
       debug: 4.4.3
       uuid: 11.1.1
     transitivePeerDependencies:
@@ -1019,18 +1019,18 @@ snapshots:
       - typeorm-aurora-data-api-driver
       - utf-8-validate
 
-  '@veramo/message-handler@7.0.1':
+  '@veramo/message-handler@7.0.2':
     dependencies:
-      '@veramo/core-types': 7.0.1
+      '@veramo/core-types': 7.0.2
       debug: 4.4.3
     transitivePeerDependencies:
       - supports-color
 
-  '@veramo/utils@7.0.1':
+  '@veramo/utils@7.0.2':
     dependencies:
       '@ipld/dag-pb': 4.2.0
       '@noble/curves': 1.9.7
-      '@veramo/core-types': 7.0.1
+      '@veramo/core-types': 7.0.2
       credential-status: 3.0.4
       cross-fetch: 4.1.0
       debug: 4.4.3
@@ -1051,7 +1051,7 @@ snapshots:
 
   ansi-regex@5.0.1: {}
 
-  ansi-regex@6.3.0: {}
+  ansi-regex@6.6.0: {}
 
   ansi-styles@4.3.0:
     dependencies:
@@ -1059,7 +1059,7 @@ snapshots:
 
   ansi-styles@6.2.3: {}
 
-  ansis@4.4.0: {}
+  ansis@4.5.0: {}
 
   app-root-path@3.1.0: {}
 
@@ -1071,7 +1071,7 @@ snapshots:
 
   base64-js@1.5.1: {}
 
-  brace-expansion@2.1.7:
+  brace-expansion@2.1.8:
     dependencies:
       balanced-match: 1.0.2
 
@@ -1300,7 +1300,7 @@ snapshots:
 
   minimatch@9.0.9:
     dependencies:
-      brace-expansion: 2.1.7
+      brace-expansion: 2.1.8
 
   minipass@7.1.3: {}
 
@@ -1388,7 +1388,7 @@ snapshots:
 
   strip-ansi@7.2.0:
     dependencies:
-      ansi-regex: 6.3.0
+      ansi-regex: 6.6.0
 
   to-buffer@1.2.2:
     dependencies:
@@ -1400,7 +1400,7 @@ snapshots:
 
   tslib@2.7.0: {}
 
-  tslib@2.8.1: {}
+  tslib@2.9.1: {}
 
   typed-array-buffer@1.0.3:
     dependencies:
@@ -1411,7 +1411,7 @@ snapshots:
   typeorm@0.3.31:
     dependencies:
       '@sqltools/formatter': 1.2.5
-      ansis: 4.4.0
+      ansis: 4.5.0
       app-root-path: 3.1.0
       buffer: 6.0.3
       dayjs: 1.11.23
@@ -1422,7 +1422,7 @@ snapshots:
       reflect-metadata: 0.2.2
       sha.js: 2.4.12
       sql-highlight: 6.1.0
-      tslib: 2.8.1
+      tslib: 2.9.1
       uuid: 11.1.1
       yargs: 17.7.3
     transitivePeerDependencies:
@@ -1456,12 +1456,9 @@ snapshots:
 
   validator@13.15.35: {}
 
-  web-did-resolver@2.0.32:
+  web-did-resolver@3.2.0:
     dependencies:
-      cross-fetch: 4.1.0
-      did-resolver: 4.1.0
-    transitivePeerDependencies:
-      - encoding
+      did-resolver: 6.0.0
 
   webidl-conversions@3.0.1: {}
 
