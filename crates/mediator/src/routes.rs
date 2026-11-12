@@ -6,9 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
 use tower_http::trace::TraceLayer;
@@ -37,7 +37,8 @@ const ENCRYPTED: &str = "application/didcomm-encrypted+json";
     ),
     tags(
         (name = "didcomm", description = "DIDComm Messaging transport and the mediator's DID"),
-        (name = "operations", description = "Service health and metadata")
+        (name = "operations", description = "Service health and metadata"),
+        (name = "portal", description = "The administration portal and signing in with the Almena wallet")
     )
 )]
 struct ApiDoc;
@@ -62,6 +63,19 @@ pub struct AppState {
     /// Turns `true` when the mediator is shutting down: open WebSockets are
     /// closed (`1001`, going away) so that they do not hold the shutdown up.
     pub stopping: tokio::sync::watch::Receiver<bool>,
+    /// The administration: the site, its administrators and their sessions.
+    pub admin: Arc<crate::admin::AdminStore>,
+    /// Sign-in requests waiting for a wallet.
+    pub signins: Arc<crate::signin::SignIns>,
+    /// The URL comes from `ALMENA_PUBLIC_URL`, so it is moved there, not
+    /// from the portal.
+    pub url_pinned: bool,
+    /// Plain HTTP for the HTTPS check of a domain being proven
+    /// (`ALMENA_OUTBOUND_ALLOW_INSECURE`).
+    pub allow_insecure: bool,
+    /// Notified when the site moved: the mediator restarts as its new
+    /// `did:web`.
+    pub restart: Arc<tokio::sync::Notify>,
 }
 
 /// WebSockets open at once per client, at most.
@@ -168,6 +182,29 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(invitation))
         .routes(routes!(invitation_page))
         .routes(routes!(health))
+        .routes(routes!(crate::portal::setup, crate::portal::claim))
+        .routes(routes!(crate::portal::portal))
+        .routes(routes!(crate::portal::sign_in_status))
+        .routes(routes!(crate::portal::renew_sign_in))
+        .routes(routes!(crate::portal::sign_out))
+        .routes(routes!(crate::portal::read_request))
+        .routes(routes!(crate::portal::answer_request))
+        .routes(routes!(crate::portal::create_invitation))
+        .routes(routes!(crate::portal::invite_admin))
+        .routes(routes!(crate::portal::show_invitation))
+        .routes(routes!(crate::portal::withdraw_invitation))
+        .routes(routes!(crate::portal::remove_member))
+        .routes(routes!(crate::portal::remove_admin))
+        .routes(routes!(crate::portal::join))
+        .routes(routes!(crate::portal::mailboxes))
+        .routes(routes!(crate::portal::remove_mailbox))
+        .routes(routes!(crate::portal::members))
+        .routes(routes!(crate::portal::admins))
+        .routes(routes!(crate::portal::site))
+        .routes(routes!(crate::portal::move_url))
+        .routes(routes!(crate::portal::check_move))
+        .routes(routes!(crate::portal::cancel_move))
+        .routes(routes!(crate::portal::domain_proof))
         .with_state(state)
         .split_for_parts();
     router
@@ -180,25 +217,28 @@ pub fn router(state: AppState) -> Router {
 ///
 /// What a browser shows at the mediator's root: the
 /// status, version and DID that `/health` also reports, and the mediation
-/// invitation as a QR code for the wallet.
+/// invitation as a QR code for the wallet. Until the onboarding is over —
+/// while the mediator has no administrator — it leads to `/setup`.
 #[utoipa::path(
     get,
     path = "/",
     tag = "operations",
-    responses((status = 200, description = "HTML page", content_type = "text/html"))
+    responses(
+        (status = 200, description = "HTML page", content_type = "text/html"),
+        (status = 303, description = "To the onboarding, while there is no administrator")
+    )
 )]
-async fn home_page(State(state): State<AppState>) -> Html<String> {
+async fn home_page(State(state): State<AppState>) -> Response {
+    if state.admin.admin_count().is_ok_and(|count| count == 0) {
+        return Redirect::to("/setup").into_response();
+    }
     let healthy = state.store.ping().await.is_ok();
     let identity = state.mediator.identity();
     let invitation = oob::invitation(identity);
     let url = oob::invitation_url(&state.public_url, &invitation);
-    Html(home::page(
-        healthy,
-        crate::VERSION,
-        &identity.did,
-        &url,
-        &oob::wallet_url(&invitation),
-    ))
+    let wallet = oob::wallet_url(&invitation);
+    let offer = (!state.mediator.limits().private).then_some((url.as_str(), wallet.as_str()));
+    Html(home::page(healthy, crate::VERSION, &identity.did, offer)).into_response()
 }
 
 /// Icon
@@ -345,7 +385,7 @@ async fn receive(
         }
         Err(err @ ReceiveError::BadForward(_)) => error(StatusCode::BAD_REQUEST, err.to_string()),
         Err(err @ ReceiveError::UnknownRecipient) => error(StatusCode::NOT_FOUND, err.to_string()),
-        Err(err @ (ReceiveError::QueueFull | ReceiveError::OutOfStorage)) => {
+        Err(err @ ReceiveError::QueueFull) => {
             error(StatusCode::INSUFFICIENT_STORAGE, err.to_string())
         }
         Err(err @ ReceiveError::RelayRateLimited) => {
@@ -621,12 +661,35 @@ async fn invitation(State(state): State<AppState>) -> Json<InvitationBody> {
     get,
     path = "/oob",
     tag = "didcomm",
+    params(OobQuery),
     responses((status = 200, description = "HTML page", content_type = "text/html"))
 )]
-async fn invitation_page(State(state): State<AppState>) -> Html<String> {
+async fn invitation_page(
+    State(state): State<AppState>,
+    Query(query): Query<OobQuery>,
+) -> Html<String> {
     let identity = state.mediator.identity();
-    let wallet_url = oob::wallet_url(&oob::invitation(identity));
-    Html(oob::page(&identity.did, &wallet_url))
+    // The invitation it was opened with, if it is ours (a member's carries
+    // its own id); else the mediator's, which a private one does not offer.
+    let given = query
+        ._oob
+        .as_deref()
+        .and_then(|encoded| oob::read(identity, encoded));
+    let wallet_url = match given {
+        Some(invitation) => Some(oob::wallet_url(&invitation)),
+        None if !state.mediator.limits().private => {
+            Some(oob::wallet_url(&oob::invitation(identity)))
+        }
+        None => None,
+    };
+    Html(oob::page(&identity.did, wallet_url.as_deref()))
+}
+
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+struct OobQuery {
+    /// The invitation, base64url JSON.
+    #[allow(non_snake_case, reason = "the parameter's name in Out-of-Band 2.0")]
+    _oob: Option<String>,
 }
 
 /// The client IP: the last address in the configured proxy header (the one
@@ -647,6 +710,26 @@ fn client_ip(headers: &HeaderMap, state: &AppState, peer: Option<SocketAddr>) ->
             .next_back()
             .or(Some(peer)),
         _ => peer,
+    }
+}
+
+/// The client a request comes from, as the rate limit counts it ([`client_key`]
+/// of [`client_ip`]): what the portal's sign-in requests are capped by.
+#[derive(Debug, Clone, Copy)]
+pub struct Client(pub Option<IpAddr>);
+
+impl axum::extract::FromRequestParts<AppState> for Client {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        Ok(Self(client_ip(&parts.headers, state, peer).map(client_key)))
     }
 }
 
@@ -774,18 +857,15 @@ pub struct Health {
     /// `ok` or `unavailable`.
     #[schema(example = "ok")]
     pub storage: &'static str,
-    /// `redis`, or `memory` in development.
-    #[schema(example = "redis")]
-    pub storage_kind: &'static str,
-    /// `ok`, or `full` when new mediations are denied (too many held, or the
-    /// store at its high water); the mediations held keep working.
+    /// `ok`, or `full` when new mediations are denied (too many held); the
+    /// mediations held keep working.
     #[schema(example = "ok")]
     pub capacity: &'static str,
 }
 
 /// Health check
 ///
-/// Answers `200` while the service and its storage (Redis) are up, `503`
+/// Answers `200` while the service and its storage (SQLite) are up, `503`
 /// when storage is unreachable. The container healthcheck calls it.
 #[utoipa::path(
     get,
@@ -804,7 +884,6 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
         version: crate::VERSION,
         did: state.mediator.identity().did.clone(),
         storage: if healthy { "ok" } else { "unavailable" },
-        storage_kind: state.store.kind(),
         capacity: if state.mediator.at_capacity() {
             "full"
         } else {
@@ -832,13 +911,13 @@ mod tests {
 
     use super::*;
     use crate::Config;
-    use crate::store::MemoryStore;
+    use crate::store::SqliteStore;
     use crate::testing::{LIMITS, Wallet, mediator_on};
 
     const MAX: usize = LIMITS.max_message_bytes;
 
     fn state() -> AppState {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::memory().unwrap());
         AppState {
             mediator: Arc::new(mediator_on(Arc::clone(&store))),
             store,
@@ -849,6 +928,11 @@ mod tests {
             public_url: "https://mediator.example.com".into(),
             sockets: Arc::new(Sockets::new(100)),
             stopping: tokio::sync::watch::channel(false).1,
+            admin: Arc::new(crate::admin::AdminStore::memory().unwrap()),
+            signins: Arc::default(),
+            url_pinned: false,
+            allow_insecure: false,
+            restart: Arc::default(),
         }
     }
 
@@ -880,6 +964,652 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// One request through the router: status, the cookies it sets, body.
+    async fn call(state: &AppState, request: Request<Body>) -> (StatusCode, Vec<String>, String) {
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, cookies, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn with_cookie(method: &str, path: &str, cookie: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// The `name=value` a `Set-Cookie` sets.
+    fn cookie_pair<'a>(cookies: &'a [String], name: &str) -> &'a str {
+        cookies
+            .iter()
+            .find(|c| c.starts_with(&format!("{name}=")))
+            .and_then(|c| c.split(';').next())
+            .unwrap()
+    }
+
+    /// The wallet's part: reads the request the browser's cookie names and
+    /// answers it, signed by `key`. Returns the DID it signed as.
+    async fn wallet_answers(
+        state: &AppState,
+        signin_cookie: &str,
+        key: &almena_didcomm::SecretKey,
+    ) -> String {
+        let id = signin_cookie
+            .trim_start_matches("almena_signin=")
+            .split('.')
+            .next()
+            .unwrap();
+        let (status, _, body) = call(
+            state,
+            Request::get(format!("/portal/requests/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(request["client_id"], "https://mediator.example.com");
+        assert_eq!(request["purpose"], "sign_in");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (token, did) = crate::signin::wallet_token(
+            key,
+            "https://mediator.example.com",
+            request["nonce"].as_str().unwrap(),
+            now,
+        );
+        let (status, _, _) = call(
+            state,
+            Request::post(format!("/portal/requests/{id}/response"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("id_token={token}")))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        did
+    }
+
+    #[tokio::test]
+    async fn the_first_wallet_with_the_code_becomes_administrator_and_signs_in() {
+        use almena_didcomm::SecretKey;
+        let state = state();
+        let code = state.admin.new_setup_code().unwrap();
+        let owner = SecretKey::generate(Curve::Ed25519).unwrap();
+
+        // Without the right code, no wallet request.
+        let (_, cookies, body) = call(
+            &state,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("code=wrong"))
+                .unwrap(),
+        )
+        .await;
+        assert!(body.contains("That is not the setup code."));
+        assert!(cookies.is_empty());
+
+        // With it: a QR code, and this browser's cookie to collect the answer.
+        let (status, cookies, body) = call(
+            &state,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("code={code}")))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(
+            "almena://auth?request_uri=https%3A%2F%2Fmediator.example.com%2Fportal%2Frequests%2F"
+        ));
+        let first = cookie_pair(&cookies, "almena_signin").to_owned();
+        assert!(
+            cookies[0].contains("HttpOnly")
+                && cookies[0].contains("SameSite=Strict")
+                && cookies[0].contains("Secure")
+        );
+        let poll = |cookie: String| with_cookie("POST", "/portal/sign-in/status", &cookie);
+        let (_, _, body) = call(&state, poll(first.clone())).await;
+        assert!(body.contains("\"waiting\""));
+
+        // The code on screen is swapped for a new one, with a new cookie.
+        let (_, cookies, body) =
+            call(&state, with_cookie("POST", "/portal/sign-in/renew", &first)).await;
+        assert!(body.contains("\"renewed\"") && body.contains("<svg"));
+        let signin = cookie_pair(&cookies, "almena_signin").to_owned();
+        assert_ne!(signin, first);
+        let (_, _, body) = call(&state, poll(first.clone())).await;
+        assert!(body.contains("\"gone\""));
+        let (_, _, body) = call(&state, poll(signin.clone())).await;
+        assert!(body.contains("\"waiting\""));
+
+        let did = wallet_answers(&state, &signin, &owner).await;
+        // Another browser without the cookie collects nothing.
+        let (_, _, body) = call(&state, poll("almena_signin=x.y".into())).await;
+        assert!(body.contains("\"gone\""));
+        let (_, cookies, body) = call(&state, poll(signin)).await;
+        assert!(body.contains("\"signed_in\""));
+        assert!(state.admin.is_admin(&did).unwrap());
+        // The setup code went with it.
+        assert!(!state.admin.is_setup_code(&code).unwrap());
+        let session = cookie_pair(&cookies, "almena_admin").to_owned();
+
+        // The dashboard knows them; the setup page says it is done.
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains("<h1>Overview</h1>") && body.contains(&did));
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/admins", &session)).await;
+        assert!(body.contains(&did) && body.contains("(you)"));
+        let (_, _, body) = call(
+            &state,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("code={code}")))
+                .unwrap(),
+        )
+        .await;
+        assert!(body.contains("Set up already"));
+
+        // A wallet that is not an administrator signs in to nothing.
+        let stranger = SecretKey::generate(Curve::Ed25519).unwrap();
+        let (_, cookies, body) =
+            call(&state, Request::get("/portal").body(Body::empty()).unwrap()).await;
+        assert!(body.contains("Sign in"));
+        let signin = cookie_pair(&cookies, "almena_signin").to_owned();
+        wallet_answers(&state, &signin, &stranger).await;
+        let (_, cookies, body) = call(&state, poll(signin)).await;
+        assert!(body.contains("\"not_an_admin\""));
+        assert!(
+            !cookies
+                .iter()
+                .any(|c| c.starts_with("almena_admin=") && !c.contains("Max-Age=0"))
+        );
+
+        // The administrator signs in again with the same wallet.
+        let (_, cookies, _) =
+            call(&state, Request::get("/portal").body(Body::empty()).unwrap()).await;
+        let signin = cookie_pair(&cookies, "almena_signin").to_owned();
+        assert_eq!(wallet_answers(&state, &signin, &owner).await, did);
+        let (_, _, body) = call(&state, poll(signin)).await;
+        assert!(body.contains("\"signed_in\""));
+
+        // Signing out from another site is refused; from here it ends the session.
+        let foreign = Request::post("/portal/sign-out")
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(&state, foreign).await.0, StatusCode::FORBIDDEN);
+        let (status, _, _) = call(&state, with_cookie("POST", "/portal/sign-out", &session)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains("Sign in"));
+    }
+
+    /// A private mediator, its administration shared with its dispatcher.
+    fn private_state() -> AppState {
+        let mut state = state();
+        let mediator = crate::dispatch::Mediator::new(
+            crate::identity::Identity::ephemeral("https://mediator.example.com").unwrap(),
+            Arc::clone(&state.store),
+            crate::dispatch::Limits {
+                private: true,
+                ..LIMITS
+            },
+            None,
+        )
+        .with_admin(Arc::clone(&state.admin));
+        state.mediator = Arc::new(mediator);
+        state
+            .admin
+            .set_site(&crate::admin::Site {
+                public_url: "https://mediator.example.com".into(),
+                access: crate::config::Access::Private,
+            })
+            .unwrap();
+        state
+    }
+
+    fn form(path: &str, cookie: &str, body: &str) -> Request<Body> {
+        Request::post(path)
+            .header(header::COOKIE, cookie)
+            .header(header::ORIGIN, "https://mediator.example.com")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn administrators_invite_members_and_other_administrators() {
+        use almena_didcomm::SecretKey;
+        let state = private_state();
+        state.admin.add_admin("did:key:z6Mk-first", 1).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session = format!(
+            "almena_admin={}",
+            state.admin.new_session("did:key:z6Mk-first", now).unwrap()
+        );
+
+        // A private mediator's pages offer no invitation to strangers.
+        let (_, _, body) = call(&state, Request::get("/").body(Body::empty()).unwrap()).await;
+        assert!(body.contains("private mediator") && !body.contains("invitation QR code"));
+        let (_, _, body) = call(&state, Request::get("/oob").body(Body::empty()).unwrap()).await;
+        assert!(
+            body.contains("Ask one of them for an invitation") && !body.contains("almena://oob")
+        );
+
+        // Without a session, or from another site, nothing is made.
+        let (status, _, _) = call(
+            &state,
+            form("/portal/invitations", "", "label=Ana&uses=1&days=7"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let foreign = Request::post("/portal/invitations")
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("label=Ana&uses=1&days=7"))
+            .unwrap();
+        assert_eq!(call(&state, foreign).await.0, StatusCode::FORBIDDEN);
+        let (status, _, _) = call(
+            &state,
+            form("/portal/invitations", &session, "label=Ana&uses=0&days=7"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            state
+                .admin
+                .invitations(crate::admin::InvitationKind::Member, now)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A member invitation, shown as the mediator's own with its id.
+        let response = router(state.clone())
+            .oneshot(form(
+                "/portal/invitations",
+                &session,
+                "label=Ana&uses=1&days=7",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let id = location
+            .trim_start_matches("/portal/invitations/")
+            .to_owned();
+        let (status, _, body) = call(&state, with_cookie("GET", &location, &session)).await;
+        assert_eq!(status, StatusCode::OK);
+        let start = body.find("https://mediator.example.com/oob?_oob=").unwrap();
+        let url = &body[start..start + body[start..].find('"').unwrap()];
+        // Opened in a browser without the wallet, it leads into the wallet with itself.
+        let path = url.trim_start_matches("https://mediator.example.com");
+        let (_, _, page) = call(&state, Request::get(path).body(Body::empty()).unwrap()).await;
+        let encoded = url.split_once("?_oob=").unwrap().1;
+        assert!(page.contains(&format!("almena://oob?_oob={encoded}")));
+        let invitation = oob::read(state.mediator.identity(), encoded).unwrap();
+        assert_eq!(invitation.id, id);
+
+        // Ana's wallet answers it: a mailbox, and a member.
+        let ana = Wallet::new(Curve::X25519);
+        let granted = ana
+            .request_in(
+                &state.mediator,
+                crate::dispatch::protocols::MEDIATE_REQUEST,
+                json!({}),
+                Some(&id),
+            )
+            .await;
+        assert_eq!(granted.type_, crate::dispatch::protocols::MEDIATE_GRANT);
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/members", &session)).await;
+        assert!(body.contains("<strong>Ana</strong>"));
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/mailboxes", &session)).await;
+        assert!(body.contains("<th>Member</th>") && body.contains("<td>Ana</td>"));
+        // Spent: no longer listed.
+        assert!(!body.contains(&format!("/portal/invitations/{id}")));
+
+        // Removing her deletes her mailbox.
+        let (status, _, _) = call(
+            &state,
+            form(
+                "/portal/members/remove",
+                &session,
+                &format!("mediation={}", ana.did.replace(':', "%3A")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(!state.store.has_mediation(&ana.did).await.unwrap());
+        assert!(state.admin.members().unwrap().is_empty());
+
+        // An invitation to be an administrator, taken by signing in at its link.
+        let response = router(state.clone())
+            .oneshot(form("/portal/admins/invite", &session, "label=Bea"))
+            .await
+            .unwrap();
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let id = location
+            .trim_start_matches("/portal/invitations/")
+            .to_owned();
+        let (_, _, body) = call(&state, with_cookie("GET", &location, &session)).await;
+        assert!(body.contains(&format!("https://mediator.example.com/portal/join/{id}")));
+        let (status, cookies, _) = call(
+            &state,
+            Request::get(format!("/portal/join/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let signin = cookie_pair(&cookies, "almena_signin").to_owned();
+        let bea = SecretKey::generate(Curve::Ed25519).unwrap();
+        let did = wallet_answers(&state, &signin, &bea).await;
+        let (_, cookies, body) = call(
+            &state,
+            with_cookie("POST", "/portal/sign-in/status", &signin),
+        )
+        .await;
+        assert!(body.contains("\"signed_in\""));
+        assert!(cookies.iter().any(|c| c.starts_with("almena_admin=")));
+        assert!(state.admin.is_admin(&did).unwrap());
+        // One use: the link is spent.
+        let (status, _, _) = call(
+            &state,
+            Request::get(format!("/portal/join/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Administrators are equal: Bea's removal by the first ends her sessions.
+        let (status, _, _) = call(
+            &state,
+            form(
+                "/portal/admins/remove",
+                &session,
+                &format!("did={}", did.replace(':', "%3A")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(!state.admin.is_admin(&did).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_public_mediator_makes_no_member_invitations() {
+        let state = state();
+        state.admin.add_admin("did:key:z6Mk-first", 1).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session = format!(
+            "almena_admin={}",
+            state.admin.new_session("did:key:z6Mk-first", now).unwrap()
+        );
+        let (status, _, _) = call(
+            &state,
+            form("/portal/invitations", &session, "label=Ana&uses=1&days=7"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, _, body) = call(&state, Request::get("/oob").body(Body::empty()).unwrap()).await;
+        assert!(body.contains("almena://oob?_oob="));
+    }
+
+    /// A session for a new administrator `did`.
+    fn session_for(state: &AppState, did: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        state.admin.add_admin(did, now).unwrap();
+        format!(
+            "almena_admin={}",
+            state.admin.new_session(did, now).unwrap()
+        )
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_lists_and_removes_mailboxes() {
+        let state = state();
+        let session = session_for(&state, "did:key:z6Mk-first");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Without a session, every section leads to signing in.
+        for path in [
+            "/portal/mailboxes",
+            "/portal/members",
+            "/portal/admins",
+            "/portal/site",
+        ] {
+            let (status, _, _) =
+                call(&state, Request::get(path).body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
+        }
+        // A public mediator has no members' section.
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains(r#"href="/portal/mailboxes""#));
+        assert!(!body.contains(r#"href="/portal/members""#));
+        let (status, _, _) = call(&state, with_cookie("GET", "/portal/members", &session)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+
+        // A wallet's mailbox, with a message waiting.
+        let wallet = Wallet::new(Curve::X25519);
+        let granted = wallet
+            .request_in(
+                &state.mediator,
+                crate::dispatch::protocols::MEDIATE_REQUEST,
+                json!({}),
+                None,
+            )
+            .await;
+        assert_eq!(granted.type_, crate::dispatch::protocols::MEDIATE_GRANT);
+        let recipient = "did:peer:2.recipient-x";
+        state
+            .store
+            .add_recipient(&wallet.did, recipient, 10)
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(&wallet.did, recipient, "hello", now, LIMITS.queue)
+            .await
+            .unwrap();
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains(r#"<span class="label">Mailboxes</span><strong>1</strong>"#));
+        assert!(body.contains(r#"<span class="label">Messages waiting</span><strong>1</strong>"#));
+        assert!(body.contains("at most 1 in one mailbox, of 3"));
+        let (_, _, body) = call(
+            &state,
+            with_cookie("GET", "/portal/mailboxes?q=recipient-x", &session),
+        )
+        .await;
+        assert!(body.contains(&format!(r#"title="{}""#, wallet.did)));
+        assert!(body.contains("1 mailbox match"));
+        // Its DIDs against the ceiling (3 in the test mediator).
+        assert!(body.contains(r#"<td class="num">1<span> / 3</span></td>"#));
+        let (_, _, body) = call(
+            &state,
+            with_cookie("GET", "/portal/mailboxes?q=nothing-like-it", &session),
+        )
+        .await;
+        assert!(body.contains("No mailbox matches."));
+
+        // Removed only from this mediator's pages.
+        let mediation = format!("mediation={}", wallet.did.replace(':', "%3A"));
+        let foreign = Request::post("/portal/mailboxes/remove")
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(mediation.clone()))
+            .unwrap();
+        assert_eq!(call(&state, foreign).await.0, StatusCode::FORBIDDEN);
+        assert!(state.store.has_mediation(&wallet.did).await.unwrap());
+        let (status, _, _) = call(
+            &state,
+            form("/portal/mailboxes/remove", &session, &mediation),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(!state.store.has_mediation(&wallet.did).await.unwrap());
+        assert_eq!(state.store.mediation_of(recipient).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_site_moves_only_to_a_proven_domain() {
+        let state = state();
+        state
+            .admin
+            .set_site(&crate::admin::Site {
+                public_url: "https://mediator.example.com".into(),
+                access: crate::config::Access::Public,
+            })
+            .unwrap();
+        let session = session_for(&state, "did:key:z6Mk-first");
+        let (status, _, _) = call(
+            &state,
+            Request::get("/.well-known/almena-setup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/site", &session)).await;
+        assert!(body.contains("New public URL") && body.contains("has to connect again"));
+
+        // Only a bare https domain, and not the one it has.
+        for (url, why) in [
+            ("http%3A%2F%2Fother.example.com", "https://"),
+            ("other.example.com%2Fpath", "nothing after the domain"),
+            ("mediator.example.com", "already"),
+        ] {
+            let (status, _, body) = call(
+                &state,
+                form("/portal/site/url", &session, &format!("url={url}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}");
+            assert!(body.contains(why), "{url}");
+        }
+        assert_eq!(state.admin.pending().unwrap(), None);
+
+        // A new domain: its value is published for the HTTPS check.
+        let (status, _, _) = call(
+            &state,
+            form("/portal/site/url", &session, "url=almena-test.invalid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let pending = state.admin.pending().unwrap().unwrap();
+        assert_eq!(pending.public_url, "https://almena-test.invalid");
+        assert_eq!(pending.access, crate::config::Access::Public);
+        let (status, _, served) = call(
+            &state,
+            Request::get("/.well-known/almena-setup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((status, served), (StatusCode::OK, pending.token.clone()));
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/site", &session)).await;
+        assert!(body.contains("_almena-mediator.almena-test.invalid"));
+        assert!(body.contains(&pending.token));
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains("Moving to <code>https://almena-test.invalid</code>"));
+
+        // Unproven, it stays where it is, and so do its administrators.
+        let (status, _, body) = call(&state, form("/portal/site/check", &session, "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"class="fail">DNS"#) && body.contains(r#"class="fail">HTTPS"#));
+        assert_eq!(
+            state.admin.site().unwrap().unwrap().public_url,
+            "https://mediator.example.com"
+        );
+        assert!(state.admin.is_admin("did:key:z6Mk-first").unwrap());
+
+        // Cancelled, nothing is published any more.
+        let (status, _, _) = call(&state, form("/portal/site/cancel", &session, "")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(state.admin.pending().unwrap(), None);
+
+        // A URL set by ALMENA_PUBLIC_URL is moved there.
+        let pinned = AppState {
+            url_pinned: true,
+            ..state.clone()
+        };
+        let (_, _, body) = call(&pinned, with_cookie("GET", "/portal/site", &session)).await;
+        assert!(body.contains("ALMENA_PUBLIC_URL") && !body.contains("New public URL"));
+        let (status, _, _) = call(
+            &pinned,
+            form("/portal/site/url", &session, "url=other.example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.admin.pending().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn wallet_answers_that_do_not_hold_are_refused() {
+        let state = state();
+        let (status, _, body) = call(
+            &state,
+            Request::get("/portal/requests/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("request_not_found"));
+        state.admin.add_admin("did:key:z6Mk-someone", 1).unwrap();
+        let (_, cookies, _) =
+            call(&state, Request::get("/portal").body(Body::empty()).unwrap()).await;
+        let id = cookie_pair(&cookies, "almena_signin")
+            .trim_start_matches("almena_signin=")
+            .split('.')
+            .next()
+            .unwrap()
+            .to_owned();
+        let answer = |body: &str| {
+            Request::post(format!("/portal/requests/{id}/response"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let (status, _, body) = call(&state, answer("id_token=a.b.c")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid_token"));
+        assert_eq!(
+            call(&state, answer("nothing=here")).await.0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -1059,8 +1789,8 @@ mod tests {
         );
     }
 
-    /// A request as the proxy in front (Caddy on the Compose network) hands
-    /// it over.
+    /// A request as a proxy in front, on the container network, hands it
+    /// over.
     fn from_proxy(request: axum::http::request::Builder) -> Request<Body> {
         let peer: SocketAddr = "172.18.0.3:40000".parse().unwrap();
         request
@@ -1152,7 +1882,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_that_cannot_count_refuses_unless_open() {
-        let store = Arc::new(MemoryStore::new());
+        let store = Arc::new(SqliteStore::memory().unwrap());
         store
             .failing_hits
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1260,7 +1990,16 @@ mod tests {
 
     #[tokio::test]
     async fn home_page_shows_the_name_and_its_icon_is_served() {
-        let (status, body) = get(state(), "/").await;
+        // Until the onboarding is over, home leads to it.
+        let fresh = state();
+        let response = router(fresh.clone())
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/setup");
+        fresh.admin.add_admin("did:key:z6Mk-first", 1).unwrap();
+        let (status, body) = get(fresh, "/").await;
         assert_eq!(status, StatusCode::OK);
         let html = String::from_utf8(body).unwrap();
         assert!(html.contains("Almena Mediator"));

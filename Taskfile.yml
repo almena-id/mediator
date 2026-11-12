@@ -14,43 +14,35 @@ tasks:
     silent: true
 
   init:
-    desc: Create .env from .env.example with a fresh TURN secret (an existing .env is left untouched)
+    desc: Create .env from .env.example (an existing .env is left untouched)
     cmds:
       - cp .env.example .env
-      - sed -i.bak "s/^ALMENA_TURN_SECRET=$/ALMENA_TURN_SECRET=$(openssl rand -hex 32)/" .env && rm .env.bak
     status:
       - test -f .env
 
-  redis:
-    desc: Start Redis in Docker (for task dev), reachable on 127.0.0.1
-    cmds:
-      - docker compose up --detach --wait redis
-
-  turn:
-    desc: Start the TURN relay (coturn) in Docker, for calls (with task dev or dev:memory)
-    cmds:
-      - docker compose --profile turn up --detach coturn
-
   dev:
-    desc: Run the mediator locally with readable debug logs; Redis must be running (task redis)
+    desc: Run the mediator locally with readable debug logs, its database in data/mediator.db
     env:
       ALMENA_LOG_FORMAT: pretty
-      ALMENA_REDIS_URL: redis://127.0.0.1:{{.ALMENA_REDIS_PORT | default "6379"}}
+      ALMENA_DB_PATH: data/mediator.db
+      ALMENA_PUBLIC_URL: '{{.ALMENA_PUBLIC_URL | default "http://localhost:8080"}}'
       RUST_LOG: '{{.RUST_LOG | default "almena_mediator=debug,tower_http=debug,info"}}'
     cmds:
       - cargo run
 
   dev:memory:
-    desc: Run the mediator locally without Docker, storing everything in memory (lost on restart)
+    desc: Run the mediator locally, storing everything in memory (lost on restart)
     env:
       ALMENA_LOG_FORMAT: pretty
-      ALMENA_REDIS_URL: memory://
+      ALMENA_DB_PATH: ":memory:"
+      ALMENA_ADMIN_DB_PATH: ":memory:"
+      ALMENA_PUBLIC_URL: '{{.ALMENA_PUBLIC_URL | default "http://localhost:8080"}}'
       RUST_LOG: '{{.RUST_LOG | default "almena_mediator=debug,tower_http=debug,info"}}'
     cmds:
       - cargo run
 
   smoke:
-    desc: "End-to-end check of a running mediator: mediation, a forwarded message, pickup (URL: task smoke -- http://host:port)"
+    desc: "End-to-end check of a running mediator: mediation, a forwarded message, pickup (URL: task smoke -- http://host:port; a private one also takes an invitation link after it)"
     cmds:
       - cargo run --quiet -p almena-mediator --example smoke -- {{.CLI_ARGS | default (printf "http://localhost:%s" (.ALMENA_MEDIATOR_PORT | default "8080"))}}
 
@@ -61,13 +53,6 @@ tasks:
 
   test:
     desc: Run the test suite
-    cmds:
-      - cargo test --locked {{.CLI_ARGS}}
-
-  test:redis:
-    desc: Run the test suite including the Redis store tests; Redis must be running (task redis)
-    env:
-      ALMENA_TEST_REDIS_URL: redis://127.0.0.1:{{.ALMENA_REDIS_PORT | default "6379"}}
     cmds:
       - cargo test --locked {{.CLI_ARGS}}
 
@@ -89,21 +74,21 @@ tasks:
       - task: test
 
   clean:
-    desc: Remove build output, the Veramo client's installed packages and copied certificate, and the local Docker image
+    desc: Remove build output, the Veramo client's installed packages and the local Docker image
     cmds:
       - cargo clean
-      - rm -rf interop/veramo/node_modules interop/veramo/caddy-root.crt
+      - rm -rf interop/veramo/node_modules
       - docker image rm -f {{.IMAGE}}
 
   clean:all:
-    desc: Leave the repository as cloned — clean, plus the containers and their volumes, .env, the local keys, Caddy's certificates, the interop clients' packages and the Task checksums (the push credentials in secrets/ are kept)
-    prompt: Remove the containers and volumes (keys, Redis), .env, the local keys in data/ and Caddy's certificates? The mediator's DID changes with new keys.
+    desc: Leave the repository as cloned — clean, plus the containers and their volumes, .env, the local keys and databases, the interop clients' packages and the Task checksums (the push credentials in secrets/ are kept)
+    prompt: Remove the containers and volumes (keys, databases), .env and the local keys and databases in data/? The mediator's DID changes with new keys, and it starts its onboarding again.
     cmds:
       # By the project's name, away from compose.yml: it needs no .env, so a
       # second run, or one after .env is gone, still works.
       - cd / && docker compose --project-name almena-mediator down --volumes --remove-orphans
       - task: clean
-      - rm -rf data caddy .task
+      - rm -rf data .task
       - find interop -name node_modules -type d -prune -exec rm -rf {} +
       - find . -maxdepth 1 -name '.env*' ! -name '.env.example' -exec rm -f {} +
 
@@ -113,15 +98,9 @@ tasks:
       - docker compose build
 
   up:
-    desc: Start the mediator in Docker (detached) and wait until it is healthy
+    desc: Start the mediator in Docker (detached) and wait until it is healthy; whatever proxy serves it publicly is the operator's (../develop's Caddy, locally)
     cmds:
       - docker compose up --build --detach --wait
-
-  up:no-caddy:
-    desc: Start the mediator in Docker without its Caddy (detached), for when ../develop's Caddy serves it on ports 80 and 443
-    cmds:
-      # Every other service, coturn included when its profile is on.
-      - docker compose up --build --detach --wait --scale caddy=0
 
   down:
     desc: Stop and remove the Docker containers
@@ -129,7 +108,7 @@ tasks:
       - docker compose down
 
   down:volume:
-    desc: Stop and remove the Docker containers and their volumes (deletes the Redis data)
+    desc: Stop and remove the Docker containers and their volumes (deletes the keys and the database)
     cmds:
       - docker compose down --volumes --remove-orphans
 
@@ -139,11 +118,6 @@ tasks:
     cmds:
       - docker compose exec mediator almena-mediator rotate-keys
       - docker compose restart mediator
-
-  logs:turn:
-    desc: Follow the TURN relay's container logs
-    cmds:
-      - docker compose logs --follow coturn
 
   logs:
     desc: Follow the mediator's container logs

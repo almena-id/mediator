@@ -143,13 +143,9 @@ pub fn escape(s: &str) -> String {
 }
 
 /// The root page, inside [`layout`].
-pub fn page(
-    healthy: bool,
-    version: &str,
-    did: &str,
-    invitation_url: &str,
-    wallet_url: &str,
-) -> String {
+/// `invitation`: the invitation URL and wallet link to offer, or `None` for a
+/// private mediator, which takes only the wallets its administrators invite.
+pub fn page(healthy: bool, version: &str, did: &str, invitation: Option<(&str, &str)>) -> String {
     let (state, label) = if healthy {
         ("ok", "Operational")
     } else {
@@ -161,17 +157,24 @@ pub fn page(
 <dt>Version</dt><dd><code>{version}</code></dd>
 <dt>DID</dt><dd><code id="did">{did}</code><button type="button" id="copy">Copy</button></dd>
 </dl>
-<figure><div class="qr" role="img" aria-label="Mediation invitation QR code">{qr}</div>
-<figcaption>Scan with the Almena wallet to use this mediator.</figcaption></figure>
-<a class="open" href="{wallet_url}">Open in Almena wallet</a>
+{offer}
 <script>
 document.getElementById("copy").onclick=async e=>{{try{{await navigator.clipboard.writeText(document.getElementById("did").textContent);e.target.textContent="Copied"}}catch{{e.target.textContent="Failed"}}setTimeout(()=>e.target.textContent="Copy",1500)}};
 </script>
 "#,
         version = escape(version),
         did = escape(did),
-        qr = qr_svg(invitation_url),
-        wallet_url = escape(wallet_url),
+        offer = match invitation {
+            Some((invitation_url, wallet_url)) => format!(
+                r#"<figure><div class="qr" role="img" aria-label="Mediation invitation QR code">{qr}</div>
+<figcaption>Scan with the Almena wallet to use this mediator.</figcaption></figure>
+<a class="open" href="{wallet_url}">Open in Almena wallet</a>
+"#,
+                qr = qr_svg(invitation_url),
+                wallet_url = escape(wallet_url),
+            ),
+            None => "<p class=\"private\">A private mediator: it keeps the mailboxes of the wallets its administrators invite.</p>\n".to_owned(),
+        },
     );
     layout("Almena Mediator", HOME_CSS, &main)
 }
@@ -189,13 +192,14 @@ figure{margin:.5rem 0 0;display:flex;flex-direction:column;align-items:center;ga
 .qr{width:16rem;max-width:80vw;padding:.75rem;border-radius:16px;background:#fff;box-sizing:border-box}
 .qr svg{display:block;width:100%;height:auto}
 figcaption{color:var(--muted);font-size:.875rem}
+.private{margin:0;max-width:32rem;color:var(--muted)}
 "#;
 
 /// `text` as an inline SVG QR code, dark on white: what cameras read best.
 /// Low error correction: a screen is not a scuffed label, and the ~400-byte
 /// invitation URL then needs 69 modules instead of 77, which a phone reads
 /// from further away. Empty if it does not fit, which the URL always does.
-fn qr_svg(text: &str) -> String {
+pub fn qr_svg(text: &str) -> String {
     QrCode::with_error_correction_level(text.as_bytes(), EcLevel::L)
         .map(|code| {
             code.render::<svg::Color>()
@@ -220,14 +224,18 @@ mod tests {
     fn page_shows_the_status_and_escapes_html() {
         const URL: &str = "https://x/oob?_oob=a";
         const WALLET: &str = "almena://oob?_oob=a&b";
-        assert!(page(true, "1", "did:x", URL, WALLET).contains("Operational"));
-        assert!(page(false, "1", "did:x", URL, WALLET).contains("Degraded"));
-        let html = page(true, "<1>", "did:x", URL, WALLET);
+        let offer = Some((URL, WALLET));
+        assert!(page(true, "1", "did:x", offer).contains("Operational"));
+        assert!(page(false, "1", "did:x", offer).contains("Degraded"));
+        let html = page(true, "<1>", "did:x", offer);
         assert!(html.contains("&lt;1&gt;"));
         assert!(html.contains("href=\"almena://oob?_oob=a&amp;b\""));
         assert!(html.contains("<svg"));
         assert!(!html.contains("<?xml"));
         assert!(html.contains("<header>") && html.contains("<footer>"));
+        // A private mediator offers no invitation.
+        let private = page(true, "1", "did:x", None);
+        assert!(!private.contains("invitation QR code") && private.contains("private mediator"));
     }
 
     #[test]

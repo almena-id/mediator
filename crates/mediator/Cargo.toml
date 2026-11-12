@@ -18,9 +18,9 @@ almena-didcomm = { version = "0.1.0", path = "../didcomm" }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["ws"] }
-redis = { version = "1.7.0", features = ["tokio-comp", "connection-manager"] }
 base64 = "0.23.1"
 ring = "0.17.14"
+rusqlite = { version = "0.41.1", features = ["bundled", "fallible_uint"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "http2"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
@@ -38,6 +38,7 @@ utoipa-axum = "0.3.0"
 utoipa-scalar = { version = "0.4.0", features = ["axum"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+hickory-resolver = "0.26.3"
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }

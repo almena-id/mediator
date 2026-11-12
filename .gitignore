@@ -7,9 +7,5 @@
 # Push credentials mounted by compose.yml
 /secrets
 
-# Caddy's certificates and ACME account (compose.yml)
-/caddy
-
 # Interop clients (interop/)
 node_modules/
-interop/veramo/caddy-root.crt

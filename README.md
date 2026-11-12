@@ -1,8 +1,8 @@
 # almena-mediator
 
-The mediator of Almena ID: a [DIDComm Messaging v2.0](https://identity.foundation/didcomm-messaging/spec/v2.0/) mailbox for wallets. It queues end-to-end encrypted messages until their wallet picks them up (over HTTPS, or live over a WebSocket), relays messages for wallets mediated elsewhere, wakes mobile wallets with content-free push notifications (and rings them for calls), and gives its wallets credentials for a TURN relay (coturn) for their calls. It never sees message or call content.
+The mediator of Almena ID: a [DIDComm Messaging v2.0](https://identity.foundation/didcomm-messaging/spec/v2.0/) mailbox for wallets. It queues end-to-end encrypted messages until their wallet picks them up (over HTTPS, or live over a WebSocket), relays messages for wallets mediated elsewhere and wakes mobile wallets with content-free push notifications. It never sees message content.
 
-It implements Coordinate Mediation 3.0, Routing 2.0, Message Pickup 3.0 (with live mode), Trust Ping, Discover Features, Report Problem and Out-of-Band 2.0, plus its own TURN 1.0 for call relay credentials, on top of `almena-didcomm` (`crates/didcomm`), its own DIDComm library. [SPEC.md](SPEC.md) specifies the Almena Mediator — its profile of DIDComm v2.0 and what it adds — and, in its appendices, the design and every decision behind it.
+It implements Coordinate Mediation 3.0, Routing 2.0, Message Pickup 3.0 (with live mode), Trust Ping, Discover Features, Report Problem and Out-of-Band 2.0, on top of `almena-didcomm` (`crates/didcomm`), its own DIDComm library. [SPEC.md](SPEC.md) specifies the Almena Mediator — its profile of DIDComm v2.0 and what it adds — and, in its appendices, the design and every decision behind it.
 
 ## Quick start
 
@@ -10,15 +10,19 @@ Needs Rust, [Task](https://taskfile.dev) and Docker.
 
 ```bash
 task init   # .env from .env.example
-task up     # mediator + Redis + Caddy (HTTPS) in Docker
-task up:no-caddy  # the same without Caddy, behind ../develop's
+task up     # the mediator in Docker
 ```
 
-It answers at `https://$ALMENA_DOMAIN` (`mediator.almena.id` in `.env.example`; the Caddy site, public URL and TURN URIs all follow it) and at `http://localhost:8080` (loopback only: from elsewhere, through Caddy). Point the name at this machine (in `/etc/hosts` for development); the Let's Encrypt certificate needs the domain's zone in Cloudflare and `CLOUDFLARE_API_TOKEN` (Zone / DNS / Edit) in `.env`. Without Docker, `task dev:memory` runs it in-process with everything in memory.
+It answers plain HTTP at `http://localhost:8080` (loopback only). This project is the mediator and nothing in front of it: TLS and the public name are the business of whoever runs it, with the reverse proxy of their choice (locally, `../develop`'s Caddy). The proxy must reach the mediator, serve its public URL over HTTPS with a valid certificate, and — for the rate limit to count clients, not the proxy — set a client IP header the mediator is told about (`ALMENA_CLIENT_IP_HEADER`). Without Docker, `task dev:memory` runs it in-process with everything in memory.
+
+### Setting it up
+
+A new mediator starts unconfigured: it writes a one-time **setup code** to its log (`almena-mediator setup` prints a new one) and serves only `/setup`. There the operator gives the URL it will be published at, which becomes its `did:web`, and chooses **public** (any wallet keeps its mailbox here) or **private** (only the wallets its administrators invite). The URL is proven before it is taken: a TXT record at `_almena-mediator.<host>` and `https://<host>/.well-known/almena-setup` must both show the value the page gives. Then the mediator starts in full on the same port, and the page goes on by itself to `<url>/setup`, with the same code, which makes its first **administrator**: whoever signs in there with the Almena wallet (the QR code changes every minute until a wallet reads it). Until then `/` leads to `/setup`. Administrators sign in at `/portal` the same way, to a dashboard: an **overview** (mailboxes against the ceiling, messages waiting, recipient DIDs, push devices, relays pending, the site), the **mailboxes** (searched by any of their DIDs, with what waits in each; removing one deletes it all), on a private mediator its **members** and their invitations (a QR code and a link, good for as many wallets and days as chosen), the **administrators** (all equal: they invite each other with a one-use link for 7 days and remove each other) and the **site**. The mode never changes. The URL can move: the new domain is proven the same way, then the mediator restarts as the new `did:web` — every wallet connects again, and the administrators are invited again at the new address, since the wallet signs in with a key per address. `ALMENA_PUBLIC_URL` (and `ALMENA_ACCESS`) skip the onboarding for development and tests (`task dev` sets it), and pin the URL to the variable; they are not part of a deployment's `.env`.
 
 ```bash
 task health   # {"status":"ok",…}
 task smoke    # end-to-end check: mediation, a forwarded message, pickup
+              # (a private mediator: task smoke -- <url> '<invitation link>')
 ```
 
 Every merge into `main` publishes the image `ghcr.io/almena-id/mediator` (amd64 and arm64) with a `year.month.sequence` version (e.g. `2026.09.1`, the sequence restarting each month), also tagged `latest` and `sha-<commit>`; the commit gets the git tag `v<version>`.
@@ -29,18 +33,16 @@ All settings are `ALMENA_*` environment variables; [.env.example](.env.example) 
 
 | Variable | Default | |
 |---|---|---|
-| `ALMENA_DOMAIN` | — | Domain of the deployment, for Docker Compose, Caddy and Task; `.env.example` derives the public URL and TURN URIs from it |
-| `ALMENA_PUBLIC_URL` | `http://localhost:8080` | Public origin; the mediator's DID is its `did:web` |
-| `ALMENA_REDIS_URL` / `ALMENA_REDIS_PASSWORD` | `redis://localhost:6379` / — | Storage (`memory://` for development) |
-| `ALMENA_PUSH_MODE` | `off` | `direct` to wake wallets, and ring them for calls, through FCM/APNs |
-| `ALMENA_PUSH_RING_INTERVAL` | `5` | Least seconds between two call rings to one wallet |
-| `ALMENA_TURN_URLS` / `ALMENA_TURN_SECRET` | — | TURN relay for calls: URIs given to wallets and the secret shared with coturn (`task init` generates it; coturn runs under the `turn` Compose profile) |
+| `ALMENA_PUBLIC_URL` / `ALMENA_ACCESS` | — / `public` | Development and tests only (`task dev` sets it): skip the onboarding with this public origin and mode. Never in `.env`: a deployed mediator is set up through `/setup` |
+| `ALMENA_ADMIN_DB_PATH` | `data/admin.db` | The administration's SQLite database: the site, the administrators, the setup code |
+| `ALMENA_DB_PATH` | `data/mediator.db` | The SQLite database: mediations, queues, devices, relays (`:memory:` for development) |
+| `ALMENA_PUSH_MODE` | `off` | `direct` to wake wallets through FCM/APNs |
 | `ALMENA_METRICS_ADDR` | — | Prometheus metrics on their own address |
 | `ALMENA_CLIENT_IP_HEADER` / `ALMENA_TRUSTED_PROXIES` | — / loopback and private ranges | Behind a proxy: the header with the client IP, believed only from those peers (CIDRs) |
 | `ALMENA_RATE_LIMIT` / `ALMENA_RELAY_RATE_LIMIT` | `60` / `600` | Messages per minute per client; relays per minute per destination host |
-| `ALMENA_MAX_MEDIATIONS` / `ALMENA_STORE_HIGH_WATER` / `ALMENA_MAX_SOCKETS` | `10000` / `90` / `5000` | Ceilings in all: mediations held, per cent of Redis `maxmemory`, WebSockets open; past them only what is new is refused (SPEC.md §11) |
+| `ALMENA_MAX_MEDIATIONS` / `ALMENA_MAX_SOCKETS` | `10000` / `5000` | Ceilings in all: mediations held, WebSockets open; past them only what is new is refused (SPEC.md §11) |
 
-Keep `keys.json` (the `mediator-data` volume) private and backed up: it is the mediator's identity.
+Keep `keys.json` (the `mediator-data` volume) private and backed up: it is the mediator's identity. Beside it, `mediator.db` holds the queues and `admin.db` the site and its administrators; the mediator runs as one instance.
 
 ## Endpoints
 
@@ -51,8 +53,16 @@ Keep `keys.json` (the `mediator-data` volume) private and backed up: it is the m
 | `POST /didcomm`, `GET /ws` | DIDComm over HTTPS and WebSocket |
 | `GET /.well-known/did.json` | The mediator's DID document |
 | `GET /.well-known/security.txt` | Where to report a vulnerability ([RFC 9116](https://www.rfc-editor.org/rfc/rfc9116)): this repository's private advisories; `Expires` stays 180 days ahead |
-| `GET /oob/invitation`, `GET /oob` | Out-of-Band mediation invitation (JSON, and a page for its QR URL) |
-| `GET /health` | Health, `503` while storage is down; `capacity: full` while new mediations are denied |
+| `GET /oob/invitation`, `GET /oob` | Out-of-Band mediation invitation (JSON, and a page for its QR URL, which opens the invitation it is given: a member's, on a private mediator) |
+| `GET /health` | Health, `503` while storage is down; `capacity: full` while new mediations are denied; `status: setup` while not set up |
+| `GET /setup`, `POST /setup`, `POST /setup/site`, `POST /setup/check`, `GET /.well-known/almena-setup` | The onboarding (the code always posted, never in a URL), served alone until the mediator is set up; once it is, `POST /setup` with the code makes the first administrator, and the well-known answers for a domain the URL is moving to |
+| `GET /portal`, `POST /portal/sign-in/status`, `POST /portal/sign-in/renew`, `POST /portal/sign-out` | The administration portal: signing in with the Almena wallet, then the dashboard's overview |
+| `GET /portal/mailboxes`, `POST /portal/mailboxes/remove` | Every mailbox, the most recently active first, searched by any of its DIDs; removing one |
+| `GET /portal/members`, `GET /portal/admins` | A private mediator's members and their invitations; the administrators and theirs |
+| `GET /portal/site`, `POST /portal/site/url`, `POST /portal/site/check`, `POST /portal/site/cancel` | The site; moving the URL to a proven domain, which restarts the mediator as the new `did:web` |
+| `POST /portal/invitations`, `GET /portal/invitations/{id}`, `POST /portal/invitations/{id}/withdraw` | Member invitations (a private mediator's): made, shown as a QR code and links, withdrawn |
+| `POST /portal/admins/invite`, `GET /portal/join/{id}`, `POST /portal/admins/remove`, `POST /portal/members/remove` | Inviting an administrator and joining by the link; removing administrators and members |
+| `GET /portal/requests/{id}`, `POST /portal/requests/{id}/response` | The sign-in request the wallet reads, and its `id_token` answer (SIOPv2 `direct_post`, as the registry's) |
 | `GET /docs`, `GET /openapi.json` | API reference, generated from the code |
 
 ## Development

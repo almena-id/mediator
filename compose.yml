@@ -9,29 +9,28 @@ services:
     # The mediator gives requests in flight 20 s to finish, then stops.
     stop_grace_period: 30s
     ports:
-      # Caddy reaches it over the Compose network; the host port is for local
-      # checks only. Published on every interface, anyone could reach it past
-      # Caddy and write their own X-Forwarded-For.
+      # Plain HTTP on the host, loopback by default: TLS and the public name
+      # are the business of whatever proxy the operator puts in front.
+      # Published on every interface, anyone could reach it past that proxy
+      # and write their own client IP header.
       - "${ALMENA_MEDIATOR_BIND:-127.0.0.1}:${ALMENA_MEDIATOR_PORT:-8080}:8080"
     environment:
-      ALMENA_PUBLIC_URL: ${ALMENA_PUBLIC_URL:-https://${ALMENA_DOMAIN}}
-      ALMENA_REDIS_URL: redis://redis:6379
-      ALMENA_REDIS_PASSWORD: ${ALMENA_REDIS_PASSWORD:-}
+      # The public URL and whether it is public or private are not set here:
+      # the onboarding at /setup asks for them (the setup code is in the log).
       ALMENA_MAX_MESSAGE_BYTES: ${ALMENA_MAX_MESSAGE_BYTES:-1048576}
       ALMENA_QUEUE_TTL: ${ALMENA_QUEUE_TTL:-2592000}
       ALMENA_QUEUE_MAX_MESSAGES: ${ALMENA_QUEUE_MAX_MESSAGES:-1000}
       ALMENA_QUEUE_MAX_BYTES: ${ALMENA_QUEUE_MAX_BYTES:-10485760}
-      ALMENA_MAX_RECIPIENT_DIDS: ${ALMENA_MAX_RECIPIENT_DIDS:-100}
+      ALMENA_MAX_RECIPIENT_DIDS: ${ALMENA_MAX_RECIPIENT_DIDS:-1000}
       ALMENA_MAX_MEDIATIONS: ${ALMENA_MAX_MEDIATIONS:-10000}
-      ALMENA_STORE_HIGH_WATER: ${ALMENA_STORE_HIGH_WATER:-90}
       ALMENA_MAX_SOCKETS: ${ALMENA_MAX_SOCKETS:-5000}
       ALMENA_RECIPIENT_PROOF: ${ALMENA_RECIPIENT_PROOF:-required}
       ALMENA_MEDIATION_TTL: ${ALMENA_MEDIATION_TTL:-7776000}
       ALMENA_RATE_LIMIT: ${ALMENA_RATE_LIMIT:-60}
-      # Caddy sets X-Forwarded-For to the client address. It is believed only
-      # from these peers (Caddy reaches the mediator from the Compose
-      # network's private range); anyone else is counted by its own address.
-      ALMENA_CLIENT_IP_HEADER: ${ALMENA_CLIENT_IP_HEADER:-x-forwarded-for}
+      # Behind a proxy that sets the client address in a header (e.g.
+      # x-forwarded-for), name it. It is believed only from these peers;
+      # anyone else is counted by its own address.
+      ALMENA_CLIENT_IP_HEADER: ${ALMENA_CLIENT_IP_HEADER:-}
       ALMENA_TRUSTED_PROXIES: ${ALMENA_TRUSTED_PROXIES:-127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}
       ALMENA_RATE_LIMIT_ON_ERROR: ${ALMENA_RATE_LIMIT_ON_ERROR:-closed}
       ALMENA_RELAY_RATE_LIMIT: ${ALMENA_RELAY_RATE_LIMIT:-600}
@@ -45,22 +44,17 @@ services:
       ALMENA_APNS_TEAM_ID: ${ALMENA_APNS_TEAM_ID:-}
       ALMENA_APNS_TOPIC: ${ALMENA_APNS_TOPIC:-}
       ALMENA_APNS_SANDBOX: ${ALMENA_APNS_SANDBOX:-false}
-      # TURN credentials for calls (the coturn service below); unset: off.
-      ALMENA_TURN_URLS: ${ALMENA_TURN_URLS:-}
-      ALMENA_TURN_SECRET: ${ALMENA_TURN_SECRET:-}
-      ALMENA_TURN_TTL: ${ALMENA_TURN_TTL:-86400}
-      # Not published: scrape it from the Compose network (e.g. 0.0.0.0:9090).
+      # Not published: scrape it from the container network (e.g. 0.0.0.0:9090).
       ALMENA_METRICS_ADDR: ${ALMENA_METRICS_ADDR:-}
       ALMENA_LOG_FORMAT: ${ALMENA_LOG_FORMAT:-json}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
-      # The mediator's private keys (keys.json). Mount a file here to bring your own.
+      # The mediator's private keys (keys.json) and its SQLite databases: the
+      # messages (mediator.db) and the administration (admin.db). Mount a keys
+      # file here to bring your own.
       - mediator-data:/data
       # Push credentials (FCM service account JSON, APNs .p8), read-only.
       - ./secrets:/secrets:ro
-    depends_on:
-      redis:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "almena-mediator", "healthcheck"]
       interval: 10s
@@ -68,141 +62,5 @@ services:
       retries: 3
       start_period: 5s
 
-  caddy:
-    # Caddy with the Cloudflare DNS module, for the DNS-01 challenge (Caddyfile).
-    build:
-      dockerfile_inline: |
-        FROM caddy:2-builder-alpine AS builder
-        RUN xcaddy build --with github.com/caddy-dns/cloudflare
-        FROM caddy:2-alpine
-        COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-    image: almena-caddy:dev
-    restart: unless-stopped
-    environment:
-      # The Caddyfile's site.
-      ALMENA_DOMAIN: ${ALMENA_DOMAIN:-}
-      # Writes the challenge's TXT record in the domain's Cloudflare zone.
-      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # Certificates and the ACME account, on the host (git-ignored) so they
-      # survive removing the containers and their volumes.
-      - ./caddy:/data
-      - caddy-config:/config
-    depends_on:
-      mediator:
-        condition: service_healthy
-
-  coturn:
-    # TURN relay for wallets' calls (SPEC.md §6.9). Only with the `turn`
-    # profile (COMPOSE_PROFILES=turn in .env): it needs ALMENA_TURN_SECRET.
-    image: coturn/coturn:4.18
-    profiles: [turn]
-    restart: unless-stopped
-    # With no secret, anybody could mint credentials: refuse to start.
-    entrypoint:
-      - sh
-      - -c
-      - '[ -n "$$ALMENA_TURN_SECRET" ] || { echo "ALMENA_TURN_SECRET is empty: set it in .env (openssl rand -hex 32), the same the mediator uses" >&2; exit 1; }; exec docker-entrypoint.sh "$$@"'
-      - coturn
-    environment:
-      ALMENA_TURN_SECRET: ${ALMENA_TURN_SECRET:-}
-    command:
-      - -n
-      - --log-file=stdout
-      # No telnet admin console.
-      - --no-cli
-      # Credentials are free to any mediated wallet: bound what they relay.
-      # Allocations at once, and bytes per second per allocation.
-      - --total-quota=${ALMENA_TURN_TOTAL_QUOTA:-100}
-      - --max-bps=${ALMENA_TURN_MAX_BPS:-500000}
-      # Time-limited credentials from the mediator (TURN REST API).
-      - --use-auth-secret
-      - --static-auth-secret=${ALMENA_TURN_SECRET:-}
-      - --realm=${ALMENA_TURN_REALM:-${ALMENA_DOMAIN}}
-      - --listening-port=3478
-      # Media is DTLS-SRTP end to end; TURN over TLS is not offered yet.
-      - --no-tls
-      # WebRTC relays over UDP only: no TCP relays, which would make this a
-      # TCP proxy to anywhere.
-      - --no-tcp-relay
-      - --fingerprint
-      - --min-port=${ALMENA_TURN_MIN_PORT:-49160}
-      - --max-port=${ALMENA_TURN_MAX_PORT:-49200}
-      # The address relayed candidates carry: this host as wallets reach it.
-      - --external-ip=${ALMENA_TURN_EXTERNAL_IP:-}
-      # Its own address on its own network (below): the one it relays from.
-      - --relay-ip=172.31.254.2
-      # Wallets relay to each other's relays only: never into private
-      # networks (Docker's included), except to our own relays — which
-      # coturn reaches by its relay address when two wallets share it.
-      - --no-multicast-peers
-      - --denied-peer-ip=0.0.0.0-0.255.255.255
-      - --denied-peer-ip=10.0.0.0-10.255.255.255
-      - --denied-peer-ip=100.64.0.0-100.127.255.255
-      - --denied-peer-ip=127.0.0.0-127.255.255.255
-      - --denied-peer-ip=169.254.0.0-169.254.255.255
-      - --denied-peer-ip=172.16.0.0-172.31.255.255
-      - --denied-peer-ip=192.168.0.0-192.168.255.255
-      - --denied-peer-ip=::1
-      - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-      - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-      - --allowed-peer-ip=${ALMENA_TURN_EXTERNAL_IP:-}
-      - --allowed-peer-ip=172.31.254.2
-    networks:
-      turn:
-        ipv4_address: 172.31.254.2
-    ports:
-      - "${ALMENA_TURN_PORT:-3478}:3478/udp"
-      - "${ALMENA_TURN_PORT:-3478}:3478/tcp"
-      - "${ALMENA_TURN_MIN_PORT:-49160}-${ALMENA_TURN_MAX_PORT:-49200}:${ALMENA_TURN_MIN_PORT:-49160}-${ALMENA_TURN_MAX_PORT:-49200}/udp"
-
-  redis:
-    image: redis:8-alpine
-    restart: unless-stopped
-    # AOF so that queued messages survive restarts (SPEC.md, Appendix D).
-    # An empty ALMENA_REDIS_PASSWORD leaves Redis without one.
-    command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --appendfsync
-      - everysec
-      - --requirepass
-      - ${ALMENA_REDIS_PASSWORD:-}
-      # A ceiling, and nothing evicted at it: writes fail (the mediator
-      # answers 503) rather than queued messages silently disappearing.
-      - --maxmemory
-      - ${ALMENA_REDIS_MAXMEMORY:-1gb}
-      - --maxmemory-policy
-      - noeviction
-    environment:
-      REDIS_PASSWORD: ${ALMENA_REDIS_PASSWORD:-}
-    ports:
-      # Local access for `task dev`; bound to loopback only.
-      - "127.0.0.1:${ALMENA_REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      # redis-cli refuses an empty REDISCLI_AUTH, so set it only with a password.
-      test: ["CMD-SHELL", "[ -z \"$$REDIS_PASSWORD\" ] || export REDISCLI_AUTH=\"$$REDIS_PASSWORD\"; redis-cli ping | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-networks:
-  # coturn alone, at a fixed address, so that it can be allowed as a peer
-  # (two wallets on one TURN server relay to each other through it) while
-  # the rest of Docker's addresses, the mediator's and Redis's, are not.
-  turn:
-    ipam:
-      config:
-        - subnet: 172.31.254.0/29
-
 volumes:
   mediator-data:
-  redis-data:
-  caddy-config:

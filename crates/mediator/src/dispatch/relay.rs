@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use almena_didcomm::did::did_of;
 use almena_didcomm::message::now;
-use almena_didcomm::{ContentEncryption, Urgency, b64, route_with};
+use almena_didcomm::{ContentEncryption, b64, route};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
 
@@ -46,14 +46,11 @@ const CONCURRENCY: usize = 64;
 /// The window of the per-destination rate limit.
 const RATE_WINDOW_SECS: u64 = 60;
 
-/// Routes `payloads` to `next` and hands them to the background worker; the
-/// `forward`s around them carry `urgency` on, as the one that brought them
-/// here did.
+/// Routes `payloads` to `next` and hands them to the background worker.
 pub async fn relay(
     mediator: &Mediator,
     next: &str,
     payloads: Vec<String>,
-    urgency: Urgency,
 ) -> Result<(), ReceiveError> {
     if mediator.transport().is_none() {
         return Err(ReceiveError::UnknownRecipient);
@@ -64,12 +61,11 @@ pub async fn relay(
     // refuses the forward whole, so the sender's retry duplicates nothing.
     let mut routed_all = Vec::with_capacity(payloads.len());
     for payload in payloads {
-        let routed = route_with(
+        let routed = route(
             payload,
             next,
             mediator.resolver(),
             ContentEncryption::A256CbcHs512,
-            urgency,
         )
         .await
         .map_err(|err| {

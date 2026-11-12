@@ -20,9 +20,6 @@ pub struct PackOptions {
     /// as its `DIDCommMessaging` service asks (spec: "Sender Process to Enable
     /// Forwarding"). Without a service nothing is wrapped.
     pub forward: bool,
-    /// What the `forward`s tell the recipient's mediator about how soon the
-    /// message is needed (see [`Urgency`]).
-    pub urgency: Urgency,
 }
 
 impl Default for PackOptions {
@@ -31,45 +28,6 @@ impl Default for PackOptions {
             protect_sender: false,
             anoncrypt_enc: ContentEncryption::A256CbcHs512,
             forward: true,
-            urgency: Urgency::Normal,
-        }
-    }
-}
-
-/// How soon the recipient needs a message, as the `forward`s that carry it
-/// tell its mediator (Almena's own `urgency` header). It says what kind of
-/// wake-up the message deserves and nothing else: not who sent it, nor what
-/// it says. A mediator that does not know the header ignores it, as DIDComm
-/// asks of unknown headers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Urgency {
-    /// An ordinary message: the recipient's devices get the usual wake-up.
-    #[default]
-    Normal,
-    /// A call offer: the recipient's phone rings, and the offer is worthless
-    /// once the caller gives up.
-    Call,
-}
-
-/// The `forward` header that carries [`Urgency`]; its only value is `call`.
-pub const URGENCY: &str = "urgency";
-
-impl Urgency {
-    /// The urgency a `forward` carries. Anything but `"call"`, including no
-    /// header at all, is [`Urgency::Normal`]: a value this side does not know
-    /// must not ring a phone.
-    pub fn of(message: &Message) -> Self {
-        match message.extra_headers.get(URGENCY).and_then(|v| v.as_str()) {
-            Some("call") => Self::Call,
-            _ => Self::Normal,
-        }
-    }
-
-    /// The header value, `None` for [`Urgency::Normal`] (it is never written).
-    fn header(self) -> Option<&'static str> {
-        match self {
-            Self::Normal => None,
-            Self::Call => Some("call"),
         }
     }
 }
@@ -202,14 +160,7 @@ impl Message {
         };
 
         let (message, service_uri, forwarded) = if options.forward {
-            let routed = route_with(
-                message,
-                to,
-                resolver,
-                options.anoncrypt_enc,
-                options.urgency,
-            )
-            .await?;
+            let routed = route(message, to, resolver, options.anoncrypt_enc).await?;
             (
                 routed.message,
                 routed.service_uri,
@@ -229,6 +180,12 @@ impl Message {
         })
     }
 }
+
+/// Routing hops [`route`] wraps a message for, the mediator named by a DID
+/// endpoint included. Each hop grows the message by about a third, so a
+/// stranger's DID document must not decide how many there are; DIDComm's own
+/// examples have one or two.
+pub const MAX_ROUTING_HOPS: usize = 4;
 
 /// A message made ready for transport by [`route`].
 #[derive(Debug, Clone)]
@@ -251,24 +208,13 @@ pub struct Routed {
 /// `uri` is a DID (spec: "Using a DID as an endpoint"), that DID is a
 /// mediator: its `keyAgreement` keys go first in the routing keys, and the
 /// transport URI comes from its own service. Each routing key, from last to
-/// first, gets a `forward` whose `next` is the hop after it.
+/// first, gets a `forward` whose `next` is the hop after it. More than
+/// [`MAX_ROUTING_HOPS`] hops, or one named twice, is refused.
 pub async fn route(
-    packed: String,
-    to: &str,
-    resolver: &dyn DidResolver,
-    enc: ContentEncryption,
-) -> Result<Routed> {
-    route_with(packed, to, resolver, enc, Urgency::Normal).await
-}
-
-/// [`route`], with every `forward` carrying `urgency`: each mediator on the
-/// way learns it, so the last one can wake the recipient accordingly.
-pub async fn route_with(
     mut packed: String,
     to: &str,
     resolver: &dyn DidResolver,
     enc: ContentEncryption,
-    urgency: Urgency,
 ) -> Result<Routed> {
     let recipient = did_of(to);
     let doc = resolver.resolve(recipient).await?;
@@ -296,18 +242,28 @@ pub async fn route_with(
     } else {
         endpoint.uri
     };
+    if routing_keys.len() > MAX_ROUTING_HOPS {
+        return Err(Error::unsupported(format!(
+            "a route of {} hops (at most {MAX_ROUTING_HOPS})",
+            routing_keys.len()
+        )));
+    }
+    if routing_keys
+        .iter()
+        .enumerate()
+        .any(|(i, hop)| routing_keys[..i].contains(hop))
+    {
+        return Err(Error::unsupported("a route through the same hop twice"));
+    }
 
     for (i, hop) in routing_keys.iter().enumerate().rev() {
         let next = routing_keys.get(i + 1).map_or(recipient, String::as_str);
         let envelope: serde_json::Value = serde_json::from_str(&packed)?;
-        let mut forward = Message::new(FORWARD, serde_json::json!({ "next": next }))
+        let forward = Message::new(FORWARD, serde_json::json!({ "next": next }))
             .to([did_of(hop)])
             .attachment(
                 Attachment::json(envelope).with_media_type(crate::crypto::jwe::ENCRYPTED_TYP),
             );
-        if let Some(value) = urgency.header() {
-            forward = forward.header(URGENCY, value.into());
-        }
         let hop_doc = resolver.resolve(did_of(hop)).await?;
         let keys = key_agreement_keys(&hop_doc, hop)?;
         let curve = keys[0].1.curve();
@@ -410,39 +366,4 @@ pub(crate) async fn find_signing_key(
         }
     }
     Err(Error::SecretNotFound(format!("signing key for {sign_by}")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn urgency_reads_only_call() {
-        let forward = |value: Option<serde_json::Value>| {
-            let message = Message::new(FORWARD, serde_json::json!({"next": "did:example:bob"}));
-            match value {
-                Some(value) => message.header(URGENCY, value),
-                None => message,
-            }
-        };
-        assert_eq!(Urgency::of(&forward(None)), Urgency::Normal);
-        let call = forward(Urgency::Call.header().map(Into::into));
-        assert_eq!(Urgency::of(&call), Urgency::Call);
-        // Through the wire format and back.
-        let json = call.to_plaintext_json().unwrap();
-        let parsed: Message = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.extra_headers[URGENCY], "call");
-        assert_eq!(Urgency::of(&parsed), Urgency::Call);
-        // Values this side does not know never ring.
-        for unknown in [
-            serde_json::json!("CALL"),
-            serde_json::json!("urgent"),
-            serde_json::json!(true),
-            serde_json::json!(null),
-        ] {
-            assert_eq!(Urgency::of(&forward(Some(unknown))), Urgency::Normal);
-        }
-        assert_eq!(Urgency::default(), Urgency::Normal);
-        assert_eq!(PackOptions::default().urgency, Urgency::Normal);
-    }
 }

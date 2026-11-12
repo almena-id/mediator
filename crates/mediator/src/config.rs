@@ -18,16 +18,23 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Public origin of the mediator, `scheme://host[:port]` without path
     /// (`ALMENA_PUBLIC_URL`). The mediator's DID is the `did:web` of this origin
-    /// and its DIDComm endpoint is `<origin>/didcomm`.
-    pub public_url: String,
+    /// and its DIDComm endpoint is `<origin>/didcomm`. Normally unset: the
+    /// onboarding asks for it and proves it (`setup`). Set, it skips that
+    /// proof — for development, tests and a mediator already set up.
+    pub public_url: Option<String>,
+    /// Who may hold a mailbox (`ALMENA_ACCESS`: `public` or `private`), with
+    /// `ALMENA_PUBLIC_URL`; otherwise the onboarding asks. Fixed once set.
+    pub access: Option<Access>,
+    /// SQLite database of the administration — the site, the administrators,
+    /// the setup code (`ALMENA_ADMIN_DB_PATH`); apart from the messages.
+    pub admin_db_path: PathBuf,
     /// JSON file holding the mediator's private keys (`ALMENA_KEYS_PATH`);
     /// created with fresh keys on first start.
     pub keys_path: PathBuf,
-    /// Redis connection URL (`ALMENA_REDIS_URL`). `memory://` keeps
+    /// SQLite database holding mediations, queues, devices and relays
+    /// (`ALMENA_DB_PATH`); created on first start. `:memory:` keeps
     /// everything in the process instead: development only.
-    pub redis_url: String,
-    /// Redis password (`ALMENA_REDIS_PASSWORD`); unset or empty: none.
-    pub redis_password: Option<Secret>,
+    pub db_path: String,
     /// Largest DIDComm envelope accepted, in bytes (`ALMENA_MAX_MESSAGE_BYTES`).
     pub max_message_bytes: usize,
     /// Undelivered messages are dropped after this many seconds (`ALMENA_QUEUE_TTL`).
@@ -41,9 +48,6 @@ pub struct Config {
     /// Mediations the mediator holds at once; a new one past it is denied.
     /// 0 = no limit (`ALMENA_MAX_MEDIATIONS`).
     pub max_mediations: u64,
-    /// Per cent of the store's memory ceiling (Redis `maxmemory`) past which
-    /// no new mediation or message is taken (`ALMENA_STORE_HIGH_WATER`).
-    pub store_high_water: u8,
     /// WebSockets open at once, from every client (`ALMENA_MAX_SOCKETS`).
     pub max_sockets: usize,
     /// A mediation whose wallet sends nothing for this many seconds is removed
@@ -65,8 +69,8 @@ pub struct Config {
     pub client_ip_header: Option<String>,
     /// Peers whose client IP header is believed (`ALMENA_TRUSTED_PROXIES`,
     /// comma-separated CIDRs); from anyone else the peer address counts.
-    /// Default: loopback and the private ranges, where the proxy in front of
-    /// the mediator is (Caddy on the Compose network).
+    /// Default: loopback and the private ranges, where a proxy in front of
+    /// the mediator on the same machine or container network connects from.
     pub trusted_proxies: Vec<IpNet>,
     /// Relays to one destination host per minute; 0 turns the limit off
     /// (`ALMENA_RELAY_RATE_LIMIT`).
@@ -79,31 +83,6 @@ pub struct Config {
     pub outbound_allow_insecure: bool,
     /// Push wake-ups (`ALMENA_PUSH_*`, `ALMENA_FCM_*`, `ALMENA_APNS_*`).
     pub push: PushConfig,
-    /// TURN credentials for wallets' calls (`ALMENA_TURN_*`); `None`: off.
-    pub turn: Option<TurnConfig>,
-}
-
-/// The TURN server run beside the mediator (SPEC.md §6.9).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnConfig {
-    /// `turn:`/`turns:` URIs given to wallets, comma-separated
-    /// (`ALMENA_TURN_URLS`).
-    pub urls: Vec<String>,
-    /// Secret shared with the TURN server, coturn's `static-auth-secret`
-    /// (`ALMENA_TURN_SECRET`).
-    pub secret: Secret,
-    /// Seconds the credentials are valid (`ALMENA_TURN_TTL`).
-    pub ttl_secs: u64,
-}
-
-/// A value kept out of logs: `Debug` prints `<redacted>`.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret(pub String);
-
-impl std::fmt::Debug for Secret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<redacted>")
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,9 +93,6 @@ pub struct PushConfig {
     /// Least seconds between two pushes to one mediation
     /// (`ALMENA_PUSH_MIN_INTERVAL`).
     pub min_interval_secs: u64,
-    /// Least seconds between two call rings to one mediation
-    /// (`ALMENA_PUSH_RING_INTERVAL`).
-    pub ring_interval_secs: u64,
     /// Google service account key file of the wallet app's Firebase project
     /// (`ALMENA_FCM_SERVICE_ACCOUNT`).
     pub fcm_service_account: Option<PathBuf>,
@@ -136,7 +112,6 @@ impl Default for PushConfig {
         Self {
             mode: PushMode::Off,
             min_interval_secs: 60,
-            ring_interval_secs: 5,
             fcm_service_account: None,
             apns: None,
         }
@@ -222,6 +197,32 @@ fn ip_nets(key: &str, value: &str) -> Result<Vec<IpNet>> {
         .collect()
 }
 
+/// Who may hold a mailbox at this mediator. Chosen once, when it is set up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Any wallet that asks.
+    Public,
+    /// Only the wallets an administrator invites.
+    Private,
+}
+
+impl Access {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "public" => Some(Self::Public),
+            "private" => Some(Self::Private),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Pretty,
@@ -234,17 +235,17 @@ impl Default for Config {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080),
             metrics_addr: None,
             log_format: LogFormat::Pretty,
-            public_url: "http://localhost:8080".to_owned(),
+            public_url: None,
+            access: None,
+            admin_db_path: PathBuf::from("data/admin.db"),
             keys_path: PathBuf::from("data/keys.json"),
-            redis_url: "redis://localhost:6379".to_owned(),
-            redis_password: None,
+            db_path: "data/mediator.db".to_owned(),
             max_message_bytes: 1024 * 1024,
             queue_ttl_secs: 30 * 24 * 3600,
             queue_max_messages: 1_000,
             queue_max_bytes: 10 * 1024 * 1024,
-            max_recipient_dids: 100,
+            max_recipient_dids: 1000,
             max_mediations: 10_000,
-            store_high_water: 90,
             max_sockets: 5_000,
             recipient_proof: true,
             mediation_ttl_secs: 90 * 24 * 3600,
@@ -258,7 +259,6 @@ impl Default for Config {
             federation: true,
             outbound_allow_insecure: false,
             push: PushConfig::default(),
-            turn: None,
         }
     }
 }
@@ -293,10 +293,21 @@ impl Config {
             }
         };
 
-        let public_url = lookup("ALMENA_PUBLIC_URL").unwrap_or(default.public_url);
-        let public_url = public_url.trim_end_matches('/').to_owned();
-        almena_didcomm::did::web::did_from_origin(&public_url)
-            .with_context(|| format!("invalid ALMENA_PUBLIC_URL: {public_url}"))?;
+        let public_url = match lookup("ALMENA_PUBLIC_URL").filter(|v| !v.trim().is_empty()) {
+            Some(url) => {
+                let url = url.trim().trim_end_matches('/').to_owned();
+                almena_didcomm::did::web::did_from_origin(&url)
+                    .with_context(|| format!("invalid ALMENA_PUBLIC_URL: {url}"))?;
+                Some(url)
+            }
+            None => None,
+        };
+        let access = match lookup("ALMENA_ACCESS").as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(value) => Some(Access::parse(value).with_context(|| {
+                format!("invalid ALMENA_ACCESS: {value} (expected public or private)")
+            })?),
+        };
         let client_ip_header = match lookup("ALMENA_CLIENT_IP_HEADER") {
             Some(v) if v.trim().is_empty() => None,
             Some(v) => {
@@ -320,11 +331,14 @@ impl Config {
             },
             log_format,
             public_url,
+            access,
+            admin_db_path: lookup("ALMENA_ADMIN_DB_PATH")
+                .filter(|p| !p.trim().is_empty())
+                .map_or(default.admin_db_path, PathBuf::from),
             keys_path: lookup("ALMENA_KEYS_PATH").map_or(default.keys_path, PathBuf::from),
-            redis_url: lookup("ALMENA_REDIS_URL").unwrap_or(default.redis_url),
-            redis_password: lookup("ALMENA_REDIS_PASSWORD")
-                .filter(|p| !p.is_empty())
-                .map(Secret),
+            db_path: lookup("ALMENA_DB_PATH")
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or(default.db_path),
             max_message_bytes: positive(
                 &lookup,
                 "ALMENA_MAX_MESSAGE_BYTES",
@@ -348,11 +362,6 @@ impl Config {
                     .with_context(|| format!("invalid ALMENA_MAX_MEDIATIONS: {v}"))?,
                 None => default.max_mediations,
             },
-            store_high_water: positive(
-                &lookup,
-                "ALMENA_STORE_HIGH_WATER",
-                default.store_high_water,
-            )?,
             max_sockets: positive(&lookup, "ALMENA_MAX_SOCKETS", default.max_sockets)?,
             mediation_ttl_secs: match lookup("ALMENA_MEDIATION_TTL") {
                 Some(v) => v
@@ -402,18 +411,12 @@ impl Config {
                 default.outbound_allow_insecure,
             )?,
             push: push(&lookup, default.push)?,
-            turn: turn(&lookup)?,
         };
         anyhow::ensure!(
             config.queue_max_bytes >= config.max_message_bytes as u64,
             "ALMENA_QUEUE_MAX_BYTES ({}) is below ALMENA_MAX_MESSAGE_BYTES ({}): no message would fit",
             config.queue_max_bytes,
             config.max_message_bytes
-        );
-        anyhow::ensure!(
-            config.store_high_water <= 100,
-            "invalid ALMENA_STORE_HIGH_WATER: {} (expected a per cent, 1 to 100)",
-            config.store_high_water
         );
         Ok(config)
     }
@@ -451,12 +454,6 @@ fn push(lookup: &impl Fn(&str) -> Option<String>, default: PushConfig) -> Result
                 .with_context(|| format!("invalid ALMENA_PUSH_MIN_INTERVAL: {v}"))?,
             None => default.min_interval_secs,
         },
-        ring_interval_secs: match lookup("ALMENA_PUSH_RING_INTERVAL") {
-            Some(v) => v
-                .parse()
-                .with_context(|| format!("invalid ALMENA_PUSH_RING_INTERVAL: {v}"))?,
-            None => default.ring_interval_secs,
-        },
         fcm_service_account: set("ALMENA_FCM_SERVICE_ACCOUNT").map(PathBuf::from),
         apns,
     };
@@ -466,46 +463,6 @@ fn push(lookup: &impl Fn(&str) -> Option<String>, default: PushConfig) -> Result
         );
     }
     Ok(push)
-}
-
-/// Credentials last a day by default, the TURN REST API's suggestion: coturn
-/// checks them again on every refresh, so they must outlast the longest call.
-const TURN_TTL: u64 = 24 * 3600;
-
-fn turn(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<TurnConfig>> {
-    let set = |key: &str| lookup(key).filter(|v| !v.trim().is_empty());
-    let (urls, secret) = match (set("ALMENA_TURN_URLS"), set("ALMENA_TURN_SECRET")) {
-        (None, None) => return Ok(None),
-        (Some(urls), Some(secret)) => (urls, secret),
-        (Some(_), None) => anyhow::bail!(
-            "ALMENA_TURN_URLS is set but ALMENA_TURN_SECRET is empty: generate one with \
-             `openssl rand -hex 32`, set it in .env for both the mediator and coturn, or \
-             empty ALMENA_TURN_URLS to turn TURN off"
-        ),
-        (None, Some(_)) => anyhow::bail!(
-            "ALMENA_TURN_SECRET is set but ALMENA_TURN_URLS is empty: list the turn: URIs \
-             wallets reach coturn at, or empty ALMENA_TURN_SECRET to turn TURN off"
-        ),
-    };
-    let urls: Vec<String> = urls
-        .split(',')
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .map(str::to_owned)
-        .collect();
-    for url in &urls {
-        anyhow::ensure!(
-            (url.starts_with("turn:") || url.starts_with("turns:"))
-                && !url.contains(char::is_whitespace),
-            "invalid ALMENA_TURN_URLS entry: {url} (expected turn: or turns: URIs)"
-        );
-    }
-    anyhow::ensure!(!urls.is_empty(), "ALMENA_TURN_URLS lists no URI");
-    Ok(Some(TurnConfig {
-        urls,
-        secret: Secret(secret),
-        ttl_secs: positive(lookup, "ALMENA_TURN_TTL", TURN_TTL)?,
-    }))
 }
 
 /// `true`/`false` (also `1`/`0`), or `default` when unset.
@@ -561,15 +518,15 @@ mod tests {
             ("ALMENA_LOG_FORMAT", "json"),
             ("ALMENA_PUBLIC_URL", "https://mediator.example.com/"),
             ("ALMENA_KEYS_PATH", "/data/keys.json"),
-            ("ALMENA_REDIS_URL", "redis://redis:6379"),
-            ("ALMENA_REDIS_PASSWORD", "s3cret"),
+            ("ALMENA_DB_PATH", "/data/mediator.db"),
+            ("ALMENA_ADMIN_DB_PATH", "/data/admin.db"),
+            ("ALMENA_ACCESS", "private"),
             ("ALMENA_MAX_MESSAGE_BYTES", "2048"),
             ("ALMENA_QUEUE_TTL", "60"),
             ("ALMENA_QUEUE_MAX_MESSAGES", "5"),
             ("ALMENA_QUEUE_MAX_BYTES", "4096"),
             ("ALMENA_MAX_RECIPIENT_DIDS", "7"),
             ("ALMENA_MAX_MEDIATIONS", "0"),
-            ("ALMENA_STORE_HIGH_WATER", "75"),
             ("ALMENA_MAX_SOCKETS", "200"),
             ("ALMENA_RECIPIENT_PROOF", "off"),
             ("ALMENA_MEDIATION_TTL", "0"),
@@ -585,18 +542,20 @@ mod tests {
         assert_eq!(config.bind, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(config.metrics_addr, Some("127.0.0.1:9090".parse().unwrap()));
         assert_eq!(config.log_format, LogFormat::Json);
-        assert_eq!(config.public_url, "https://mediator.example.com");
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://mediator.example.com")
+        );
+        assert_eq!(config.access, Some(Access::Private));
+        assert_eq!(config.admin_db_path, PathBuf::from("/data/admin.db"));
         assert_eq!(config.keys_path, PathBuf::from("/data/keys.json"));
-        assert_eq!(config.redis_url, "redis://redis:6379");
-        assert_eq!(config.redis_password, Some(Secret("s3cret".into())));
-        assert!(!format!("{config:?}").contains("s3cret"));
+        assert_eq!(config.db_path, "/data/mediator.db");
         assert_eq!(config.max_message_bytes, 2048);
         assert_eq!(config.queue_ttl_secs, 60);
         assert_eq!(config.queue_max_messages, 5);
         assert_eq!(config.queue_max_bytes, 4096);
         assert_eq!(config.max_recipient_dids, 7);
         assert_eq!(config.max_mediations, 0);
-        assert_eq!(config.store_high_water, 75);
         assert_eq!(config.max_sockets, 200);
         assert!(!config.recipient_proof);
         assert_eq!(config.mediation_ttl_secs, 0);
@@ -624,12 +583,14 @@ mod tests {
                 .is_err()
         );
         assert!(Config::from_lookup(lookup(&[("ALMENA_MAX_MESSAGE_BYTES", "0")])).is_err());
+        assert!(Config::from_lookup(lookup(&[("ALMENA_ACCESS", "members")])).is_err());
+        // Unset: the onboarding asks for both.
+        let unset = Config::from_lookup(lookup(&[])).unwrap();
+        assert_eq!((unset.public_url, unset.access), (None, None));
         assert!(Config::from_lookup(lookup(&[("ALMENA_QUEUE_TTL", "-1")])).is_err());
         // A queue smaller than one message.
         assert!(Config::from_lookup(lookup(&[("ALMENA_QUEUE_MAX_BYTES", "1000")])).is_err());
         assert!(Config::from_lookup(lookup(&[("ALMENA_CLIENT_IP_HEADER", "bad header")])).is_err());
-        assert!(Config::from_lookup(lookup(&[("ALMENA_STORE_HIGH_WATER", "0")])).is_err());
-        assert!(Config::from_lookup(lookup(&[("ALMENA_STORE_HIGH_WATER", "101")])).is_err());
         assert!(Config::from_lookup(lookup(&[("ALMENA_MAX_SOCKETS", "0")])).is_err());
         assert!(Config::from_lookup(lookup(&[("ALMENA_MAX_MEDIATIONS", "-1")])).is_err());
         assert!(Config::from_lookup(lookup(&[("ALMENA_TRUSTED_PROXIES", "10.0.0.0/33")])).is_err());
@@ -669,7 +630,6 @@ mod tests {
         let config = Config::from_lookup(lookup(&[
             ("ALMENA_PUSH_MODE", "direct"),
             ("ALMENA_PUSH_MIN_INTERVAL", "30"),
-            ("ALMENA_PUSH_RING_INTERVAL", "10"),
             ("ALMENA_FCM_SERVICE_ACCOUNT", "/secrets/fcm.json"),
             ("ALMENA_APNS_KEY_PATH", "/secrets/apns.p8"),
             ("ALMENA_APNS_KEY_ID", "KEY1234567"),
@@ -680,7 +640,6 @@ mod tests {
         .unwrap();
         assert_eq!(config.push.mode, PushMode::Direct);
         assert_eq!(config.push.min_interval_secs, 30);
-        assert_eq!(config.push.ring_interval_secs, 10);
         assert_eq!(
             config.push.fcm_service_account,
             Some(PathBuf::from("/secrets/fcm.json"))
@@ -688,55 +647,6 @@ mod tests {
         let apns = config.push.apns.unwrap();
         assert_eq!(apns.topic, "id.almena.wallet");
         assert!(apns.sandbox);
-    }
-
-    #[test]
-    fn reads_turn_settings() {
-        let config = Config::from_lookup(lookup(&[
-            (
-                "ALMENA_TURN_URLS",
-                "turn:t.example.com:3478?transport=udp, turn:t.example.com:3478?transport=tcp",
-            ),
-            ("ALMENA_TURN_SECRET", "sh4red"),
-            ("ALMENA_TURN_TTL", "600"),
-        ]))
-        .unwrap();
-        let turn = config.turn.as_ref().unwrap();
-        assert_eq!(
-            turn.urls,
-            [
-                "turn:t.example.com:3478?transport=udp",
-                "turn:t.example.com:3478?transport=tcp"
-            ]
-        );
-        assert_eq!(turn.ttl_secs, 600);
-        assert!(!format!("{config:?}").contains("sh4red"));
-        let default_ttl = Config::from_lookup(lookup(&[
-            ("ALMENA_TURN_URLS", "turns:t.example.com"),
-            ("ALMENA_TURN_SECRET", "s"),
-        ]))
-        .unwrap();
-        assert_eq!(default_ttl.turn.unwrap().ttl_secs, TURN_TTL);
-    }
-
-    #[test]
-    fn rejects_bad_turn_settings() {
-        let bad = |pairs: &[(&str, &str)]| Config::from_lookup(lookup(pairs)).is_err();
-        assert!(bad(&[("ALMENA_TURN_URLS", "turn:t.example.com")]));
-        assert!(bad(&[("ALMENA_TURN_SECRET", "s")]));
-        assert!(bad(&[
-            ("ALMENA_TURN_URLS", "stun:t.example.com"),
-            ("ALMENA_TURN_SECRET", "s")
-        ]));
-        assert!(bad(&[
-            ("ALMENA_TURN_URLS", " , "),
-            ("ALMENA_TURN_SECRET", "s")
-        ]));
-        assert!(bad(&[
-            ("ALMENA_TURN_URLS", "turn:t.example.com"),
-            ("ALMENA_TURN_SECRET", "s"),
-            ("ALMENA_TURN_TTL", "0")
-        ]));
     }
 
     #[test]

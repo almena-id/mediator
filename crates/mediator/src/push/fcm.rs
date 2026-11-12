@@ -4,9 +4,7 @@
 //! its RSA key is exchanged for an OAuth 2 access token, cached until shortly
 //! before it expires. The wake-up is a high-priority notification whose words
 //! are keys into the app's string resources, tagged so that a second one
-//! replaces the first. The call push is a high-priority data message with no
-//! notification at all: the app wakes and shows its own full-screen call
-//! screen, which a notification the system draws could not do.
+//! replaces the first.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -21,7 +19,7 @@ use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{BODY_KEY, CALL, CALL_TTL_SECS, Sent, TITLE_KEY, WAKE, jwt};
+use super::{BODY_KEY, Sent, TITLE_KEY, WAKE, jwt};
 
 const SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 const FCM_URL: &str = "https://fcm.googleapis.com";
@@ -83,21 +81,6 @@ impl Fcm {
                     "body_loc_key": BODY_KEY,
                     "tag": WAKE,
                 },
-            },
-        }))
-        .await
-    }
-
-    /// Data only: a `notification` would be drawn by the system while the
-    /// app is in the background, and the app could not ring.
-    pub async fn ring(&self, token: &str) -> Result<Sent> {
-        self.send(json!({
-            "token": token,
-            "data": {"type": CALL},
-            "android": {
-                "priority": "high",
-                "ttl": format!("{CALL_TTL_SECS}s"),
-                "collapse_key": CALL,
             },
         }))
         .await
@@ -303,17 +286,8 @@ mod tests {
                     assert_eq!(headers["authorization"], "Bearer at-1");
                     let message = &body["message"];
                     assert_eq!(message["android"]["priority"], "high");
-                    if message["data"]["type"] == CALL {
-                        assert_eq!(message["data"], json!({"type": CALL}));
-                        assert_eq!(
-                            message["android"],
-                            json!({"priority": "high", "ttl": "60s", "collapse_key": CALL})
-                        );
-                        assert!(message.get("notification").is_none());
-                    } else {
-                        assert_eq!(message["data"], json!({"type": WAKE}));
-                        assert_eq!(message["android"]["notification"]["body_loc_key"], BODY_KEY);
-                    }
+                    assert_eq!(message["data"], json!({"type": WAKE}));
+                    assert_eq!(message["android"]["notification"]["body_loc_key"], BODY_KEY);
                     match message["token"].as_str().unwrap() {
                         "good" => (StatusCode::OK, Json(json!({"name": "projects/x/messages/1"}))),
                         "gone" => (
@@ -337,7 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wakes_and_rings_with_a_cached_access_token_and_spots_dead_tokens() {
+    async fn wakes_with_a_cached_access_token_and_spots_dead_tokens() {
         let google = Arc::new(Google::default());
         let url = fake_google(Arc::clone(&google)).await;
         let account = json!({
@@ -354,8 +328,6 @@ mod tests {
         assert_eq!(fcm.wake("good").await.unwrap(), Sent::Delivered);
         assert_eq!(fcm.wake("gone").await.unwrap(), Sent::InvalidToken);
         assert!(fcm.wake("flaky").await.is_err());
-        assert_eq!(fcm.ring("good").await.unwrap(), Sent::Delivered);
-        assert_eq!(fcm.ring("gone").await.unwrap(), Sent::InvalidToken);
         assert_eq!(google.token_requests.load(Ordering::SeqCst), 1);
     }
 

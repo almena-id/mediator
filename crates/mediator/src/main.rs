@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use std::net::SocketAddr;
 
-use almena_mediator::config::PushMode;
-use almena_mediator::dispatch::turn::TurnServer;
+use almena_mediator::admin::{AdminStore, InvitationKind};
+use almena_mediator::config::{Access, PushMode};
 use almena_mediator::dispatch::{Limits, Mediator};
 use almena_mediator::identity::Identity;
 use almena_mediator::push::{Apns, DirectPusher, Fcm, Pusher};
@@ -11,7 +11,7 @@ use almena_mediator::routes::Sockets;
 use almena_mediator::store::{self, QueueLimits};
 use almena_mediator::transport::{HttpTransport, Transport};
 use almena_mediator::{AppState, Config, config::LogFormat, router};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     match std::env::args().nth(1).as_deref() {
         Some("healthcheck") => return healthcheck(&config),
+        Some("setup") => return setup_code(&config),
         Some("rotate-keys") => {
             Identity::rotate(&config.keys_path)?;
             println!(
@@ -33,13 +34,70 @@ async fn main() -> Result<()> {
     }
     init_tracing(config.log_format);
 
-    let identity = Identity::load_or_create(&config.keys_path, &config.public_url)?;
-    let store = store::open(
-        &config.redis_url,
-        config.redis_password.as_ref().map(|s| s.0.as_str()),
-    )
-    .await?;
-    if store.kind() == "memory" {
+    let admin = Arc::new(AdminStore::open(&config.admin_db_path)?);
+    let before = admin.site()?.map(|site| site.public_url);
+    let site = admin.settle(config.public_url.as_deref(), config.access)?;
+    // A setup code while nobody runs it. Not after a move from the portal:
+    // the administrators were invited again at the new address, and a code
+    // in the log would let whoever reads it claim it before they do. Once
+    // those invitations are spent or expired with nobody back, or when the
+    // move came from `ALMENA_PUBLIC_URL` (nobody was shown one), it is.
+    let moved_by_variable =
+        before.is_some() && before.as_deref() != site.as_ref().map(|site| site.public_url.as_str());
+    let reinvited = !admin
+        .invitations(InvitationKind::Admin, almena_didcomm::message::now())?
+        .is_empty();
+    let setup_code = if admin.admin_count()? == 0 && (moved_by_variable || !reinvited) {
+        let code = admin.new_setup_code()?;
+        let at = site.as_ref().map_or_else(
+            || format!("http://<this host>:{}", config.bind.port()),
+            |site| site.public_url.clone(),
+        );
+        let step = if site.is_some() {
+            "become its first administrator with your Almena wallet"
+        } else {
+            "give its public URL, choose public or private, and prove the domain"
+        };
+        announce_setup_code(config.log_format, &code, &at, step);
+        Some(code)
+    } else {
+        None
+    };
+    let site = match site {
+        Some(site) => site,
+        None => {
+            let listener = TcpListener::bind(config.bind).await?;
+            tracing::info!(addr = %listener.local_addr()?, version = almena_mediator::VERSION, "almena mediator waiting to be set up");
+            match almena_mediator::setup::run(
+                listener,
+                Arc::clone(&admin),
+                config.outbound_allow_insecure,
+                shutdown_signal(),
+            )
+            .await?
+            {
+                Some(site) => {
+                    if let Some(code) = &setup_code {
+                        announce_setup_code(
+                            config.log_format,
+                            code,
+                            &site.public_url,
+                            "become its first administrator with your Almena wallet (the domain is proven; the setup page goes on there by itself)",
+                        );
+                    }
+                    site
+                }
+                None => {
+                    tracing::info!("almena mediator stopped before it was set up");
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let identity = Identity::load_or_create(&config.keys_path, &site.public_url)?;
+    let store = store::open(&config.db_path)?;
+    if config.db_path == ":memory:" {
         tracing::warn!("in-memory storage: every mediation and queued message is lost on restart");
     }
     let limits = Limits {
@@ -52,10 +110,10 @@ async fn main() -> Result<()> {
         max_recipient_dids: config.max_recipient_dids,
         max_mediations: config.max_mediations,
         push_min_interval_secs: config.push.min_interval_secs,
-        push_ring_interval_secs: config.push.ring_interval_secs,
         recipient_proof: config.recipient_proof,
         mediation_ttl_secs: config.mediation_ttl_secs,
         relay_rate_limit: config.relay_rate_limit,
+        private: site.access == Access::Private,
     };
     let transport: Option<Arc<dyn Transport>> = if config.federation {
         if config.outbound_allow_insecure {
@@ -69,13 +127,8 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    if store.kind() == "redis" && store.memory().await?.is_none() {
-        tracing::warn!(
-            "Redis has no maxmemory: ALMENA_STORE_HIGH_WATER has nothing to measure against"
-        );
-    }
     let mut mediator = Mediator::new(identity, Arc::clone(&store), limits, transport)
-        .with_store_high_water(config.store_high_water);
+        .with_admin(Arc::clone(&admin));
     if config.push.mode == PushMode::Direct {
         let fcm = config
             .push
@@ -89,29 +142,20 @@ async fn main() -> Result<()> {
         tracing::info!(?services, "push wake-ups on (direct)");
         mediator = mediator.with_pusher(Arc::new(pusher));
     }
-    if let Some(turn) = &config.turn {
-        tracing::info!(urls = ?turn.urls, ttl = turn.ttl_secs, "TURN credentials on");
-        mediator = mediator.with_turn(TurnServer::new(
-            turn.urls.clone(),
-            &turn.secret.0,
-            turn.ttl_secs,
-        ));
-    }
     mediator.start_relays();
-    if mediator.start_live_sharing() {
-        tracing::info!("live sessions shared with the other instances on this Redis");
-    }
     mediator.start_cleanup();
     mediator.start_capacity_watch();
     let did = mediator.identity().did.clone();
     let (stop, mut stopping) = tokio::sync::watch::channel(false);
+    let restart = Arc::new(tokio::sync::Notify::new());
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         mediator: Arc::new(mediator),
         store,
         rate_limit: config.rate_limit,
         rate_limit_on_error: config.rate_limit_on_error,
         trusted_proxies: Arc::from(config.trusted_proxies.clone()),
-        public_url: config.public_url.clone(),
+        public_url: site.public_url.clone(),
         client_ip_header: config
             .client_ip_header
             .as_deref()
@@ -119,21 +163,36 @@ async fn main() -> Result<()> {
             .transpose()?,
         sockets: Arc::new(Sockets::new(config.max_sockets)),
         stopping: stopping.clone(),
+        admin: Arc::clone(&admin),
+        signins: Arc::default(),
+        url_pinned: config.public_url.is_some(),
+        allow_insecure: config.outbound_allow_insecure,
+        restart: Arc::clone(&restart),
     };
 
     if let Some(addr) = config.metrics_addr {
         almena_mediator::metrics::serve(addr).await?;
     }
     let listener = TcpListener::bind(config.bind).await?;
-    tracing::info!(addr = %listener.local_addr()?, %did, version = almena_mediator::VERSION, "almena mediator listening");
+    tracing::info!(addr = %listener.local_addr()?, %did, access = site.access.as_str(), version = almena_mediator::VERSION, "almena mediator listening");
 
     let server = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        let _ = stop.send(true);
+    .with_graceful_shutdown({
+        let restart = Arc::clone(&restart);
+        let moved = Arc::clone(&moved);
+        async move {
+            tokio::select! {
+                () = shutdown_signal() => {}
+                () = restart.notified() => {
+                    moved.store(true, std::sync::atomic::Ordering::SeqCst);
+                    tracing::info!("the public URL moved: restarting");
+                }
+            }
+            let _ = stop.send(true);
+        }
     });
     // Requests in flight get SHUTDOWN_GRACE to finish; then the process
     // stops anyway, before the container runtime kills it (compose.yml's
@@ -151,8 +210,92 @@ async fn main() -> Result<()> {
         ),
     }
 
+    if moved.load(std::sync::atomic::Ordering::SeqCst) {
+        return relaunch();
+    }
     tracing::info!("almena mediator stopped");
     Ok(())
+}
+
+/// Starts this program again in this process — same arguments, same
+/// environment, same process id (a container keeps running) — so the
+/// mediator comes up as the site's new `did:web`, with nothing of the old
+/// one left running.
+#[cfg(unix)]
+fn relaunch() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let program = std::env::current_exe().context("finding this program")?;
+    let error = std::process::Command::new(program)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(error).context("restarting the mediator")
+}
+
+/// Windows has no `exec`: the new mediator runs as a child with this
+/// process's arguments, environment and console, and this one waits for it
+/// and leaves with its exit code, so whatever started the mediator still
+/// sees one process running until the mediator stops.
+#[cfg(not(unix))]
+fn relaunch() -> Result<()> {
+    let program = std::env::current_exe().context("finding this program")?;
+    let status = std::process::Command::new(program)
+        .args(std::env::args_os().skip(1))
+        .status()
+        .context("restarting the mediator")?;
+    std::process::exit(status.code().unwrap_or(1))
+}
+
+/// `almena-mediator setup`: prints a new setup code, replacing the one in
+/// the log, while the mediator has no administrator.
+fn setup_code(config: &almena_mediator::Config) -> Result<()> {
+    let admin = AdminStore::open(&config.admin_db_path)
+        .with_context(|| format!("opening {}", config.admin_db_path.display()))?;
+    anyhow::ensure!(
+        admin.admin_count()? == 0,
+        "this mediator has administrators already: they manage it from its portal"
+    );
+    let code = admin.new_setup_code()?;
+    let at = admin.site()?.map_or_else(
+        || "http://<this host>:<port>".to_owned(),
+        |site| site.public_url,
+    );
+    println!(
+        "Setup code: {code}\nOpen:       {at}/setup and enter it\nIt works until the first administrator signs in; any earlier code no longer works."
+    );
+    Ok(())
+}
+
+/// Puts the setup code where whoever runs the mediator cannot miss it: one
+/// log line whose message carries the code and the page to enter it on
+/// (`setup_code` and `setup_url` as fields too, for JSON logs), and, with
+/// readable logs, a framed block on stderr as well. The link never carries
+/// the code: a URL ends up in access logs and browser histories.
+fn announce_setup_code(format: LogFormat, code: &str, at: &str, step: &str) {
+    let url = format!("{at}/setup");
+    tracing::warn!(
+        setup_code = %code,
+        setup_url = %url,
+        "SETUP CODE {code}: open {url} and enter it to {step}. It works until the first administrator signs in; `almena-mediator setup` prints a new one"
+    );
+    if format == LogFormat::Pretty {
+        let lines = [
+            "ALMENA MEDIATOR: SETUP CODE".to_owned(),
+            String::new(),
+            format!("  Code   {code}"),
+            format!("  Open   {url} and enter the code"),
+            format!("  Then   {step}"),
+            String::new(),
+            "It works until the first administrator signs in.".to_owned(),
+            "`almena-mediator setup` prints a new one (the old one stops working).".to_owned(),
+        ];
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let rule = "═".repeat(width + 2);
+        let body: String = lines
+            .iter()
+            .map(|line| format!("║ {line:<width$} ║\n"))
+            .collect();
+        eprintln!("\n╔{rule}╗\n{body}╚{rule}╝\n");
+    }
 }
 
 /// How long requests in flight may take to finish once a shutdown starts.

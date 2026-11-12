@@ -8,7 +8,7 @@
 # the image is out, so a failed build does not use up a number. Runs queue up
 # (never in parallel), so two merges cannot take the same number.
 #
-# Formatting, clippy and the tests (the Redis store included) go first.
+# Formatting, clippy and the tests go first.
 # Each architecture then builds on its own native runner, in parallel (no
 # emulation), and pushes its image by digest; the last job joins both into one
 # multi-architecture image and tags it:
@@ -66,12 +66,6 @@ jobs:
   check:
     name: Lint and test
     runs-on: ubuntu-24.04
-    services:
-      # The store contract runs against a real Redis too (task test:redis).
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -88,8 +82,6 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Tests
-        env:
-          ALMENA_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: cargo test --locked
 
   build:

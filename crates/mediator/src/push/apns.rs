@@ -4,9 +4,7 @@
 //! minutes as Apple asks (no more than one new token every 20 minutes, none
 //! older than an hour). The wake-up is an alert whose words are keys into the
 //! app's own strings, delivered at priority 10 and collapsed into the one
-//! before it. The call push is a PushKit (VoIP) push to the app's VoIP token,
-//! on the bundle id's `.voip` topic: iOS launches the app, which reports the
-//! call to CallKit and the phone rings.
+//! before it.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -18,7 +16,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
 use serde_json::{Value, json};
 
-use super::{BODY_KEY, CALL, CALL_TTL_SECS, Sent, TITLE_KEY, WAKE, jwt};
+use super::{BODY_KEY, Sent, TITLE_KEY, WAKE, jwt};
 
 const PRODUCTION_URL: &str = "https://api.push.apple.com";
 const SANDBOX_URL: &str = "https://api.sandbox.push.apple.com";
@@ -92,21 +90,6 @@ impl Apns {
             .header("apns-priority", "10")
             .header("apns-collapse-id", WAKE)
             .json(&payload());
-        self.send(request).await
-    }
-
-    /// Rings a VoIP `token` (hex, like [`Apns::wake`]'s). A VoIP push needs
-    /// no `aps`; it expires with the call offer, so a phone that comes back
-    /// later does not ring for a call that is over.
-    pub async fn ring(&self, token: &str) -> Result<Sent> {
-        let request = self
-            .client
-            .post(format!("{}/3/device/{token}", self.url))
-            .header("apns-topic", format!("{}.voip", self.topic))
-            .header("apns-push-type", "voip")
-            .header("apns-priority", "10")
-            .header("apns-expiration", (now() + CALL_TTL_SECS).to_string())
-            .json(&json!({"type": CALL}));
         self.send(request).await
     }
 
@@ -209,23 +192,11 @@ mod tests {
                      Json(body): Json<Value>| async move {
                         a.requests.fetch_add(1, Ordering::SeqCst);
                         assert_eq!(headers["apns-priority"], "10");
-                        if headers["apns-push-type"] == "voip" {
-                            assert_eq!(headers["apns-topic"], "id.almena.wallet.voip");
-                            let expiration: u64 = headers["apns-expiration"]
-                                .to_str()
-                                .unwrap()
-                                .parse()
-                                .unwrap();
-                            assert!(expiration > now() && expiration <= now() + 60);
-                            assert!(!headers.contains_key("apns-collapse-id"));
-                            assert_eq!(body, json!({"type": CALL}));
-                        } else {
-                            assert_eq!(headers["apns-topic"], "id.almena.wallet");
-                            assert_eq!(headers["apns-push-type"], "alert");
-                            assert_eq!(headers["apns-collapse-id"], WAKE);
-                            assert_eq!(body, payload());
-                            assert_eq!(body["aps"]["alert"]["loc-key"], BODY_KEY);
-                        }
+                        assert_eq!(headers["apns-topic"], "id.almena.wallet");
+                        assert_eq!(headers["apns-push-type"], "alert");
+                        assert_eq!(headers["apns-collapse-id"], WAKE);
+                        assert_eq!(body, payload());
+                        assert_eq!(body["aps"]["alert"]["loc-key"], BODY_KEY);
                         let bearer = headers["authorization"].to_str().unwrap();
                         let jwt = bearer.strip_prefix("Bearer ").unwrap();
                         let (input, header, claims, signature) = jwt::decode(jwt);
@@ -259,7 +230,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wakes_and_rings_with_a_reused_provider_token_and_spots_dead_tokens() {
+    async fn wakes_with_a_reused_provider_token_and_spots_dead_tokens() {
         let apple = Arc::new(Apple::default());
         let url = fake_apple(Arc::clone(&apple)).await;
         let config = ApnsConfig {
@@ -276,9 +247,7 @@ mod tests {
         assert_eq!(apns.wake("bb22").await.unwrap(), Sent::InvalidToken);
         assert_eq!(apns.wake("cc33").await.unwrap(), Sent::InvalidToken);
         assert!(apns.wake("dd44").await.is_err());
-        assert_eq!(apns.ring("aa11").await.unwrap(), Sent::Delivered);
-        assert_eq!(apns.ring("bb22").await.unwrap(), Sent::InvalidToken);
-        assert_eq!(apple.requests.load(Ordering::SeqCst), 6);
+        assert_eq!(apple.requests.load(Ordering::SeqCst), 4);
         let seen = apple.tokens_seen.lock().unwrap();
         assert!(
             seen.iter().all(|t| *t == seen[0]),

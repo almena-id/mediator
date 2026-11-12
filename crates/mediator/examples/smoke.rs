@@ -5,6 +5,10 @@
 //! ```text
 //! cargo run -p almena-mediator --example smoke -- http://localhost:8080
 //! ```
+//!
+//! A private mediator takes Bob only by invitation: pass one an
+//! administrator made (its link, `…/oob?_oob=…`) after the URL, and Bob
+//! answers it.
 
 use almena_didcomm::did::peer::{Purpose, peer2};
 use almena_didcomm::did::{ChainResolver, DidDocument, LocalResolver, StaticResolver};
@@ -64,7 +68,20 @@ impl Mediator {
 
     /// An authcrypted request with `return_route: "all"`; returns the reply.
     async fn request(&self, wallet: &Wallet, type_: &str, body: Value) -> Result<Message> {
-        let packed = Message::new(type_, body)
+        self.request_in(wallet, type_, body, None).await
+    }
+
+    /// [`Mediator::request`], answering the invitation `pthid`.
+    async fn request_in(
+        &self,
+        wallet: &Wallet,
+        type_: &str,
+        body: Value,
+        pthid: Option<&str>,
+    ) -> Result<Message> {
+        let mut message = Message::new(type_, body);
+        message.pthid = pthid.map(str::to_owned);
+        let packed = message
             .from(&wallet.did)
             .to([self.doc.id.as_str()])
             .header("return_route", json!("all"))
@@ -101,6 +118,23 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "http://localhost:8080".into());
     let base = base.trim_end_matches('/').to_owned();
+    // An invitation to answer (a private mediator's): its id is the pthid.
+    let invited = match std::env::args().nth(2) {
+        Some(link) => {
+            let encoded = link
+                .split_once("_oob=")
+                .map(|(_, rest)| rest.split('&').next().unwrap_or(rest))
+                .context("the invitation link has no _oob")?;
+            let invitation: Value = serde_json::from_slice(&b64::decode(encoded)?)?;
+            Some(
+                invitation["id"]
+                    .as_str()
+                    .context("the invitation has no id")?
+                    .to_owned(),
+            )
+        }
+        None => None,
+    };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let http = reqwest::Client::new();
 
@@ -157,13 +191,18 @@ async fn main() -> Result<()> {
         .await?;
 
     println!("3. Bob requests mediation and registers his DID");
-    mediator
-        .request(
+    let answer = mediator
+        .request_in(
             &bob,
             "https://didcomm.org/coordinate-mediation/3.0/mediate-request",
             json!({}),
+            invited.as_deref(),
         )
         .await?;
+    ensure!(
+        answer.type_.ends_with("/mediate-grant"),
+        "mediation denied (a private mediator takes Bob only with an invitation: pass its link)"
+    );
     let update = mediator
         .request(
             &bob,

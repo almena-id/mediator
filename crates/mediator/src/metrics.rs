@@ -13,7 +13,6 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 
 use crate::push::Service;
-use crate::store::StoreMemory;
 
 /// The process's metrics.
 pub static METRICS: Metrics = Metrics::new();
@@ -53,8 +52,6 @@ pub enum Forward {
 pub enum Refusal {
     /// A new mediation, with `ALMENA_MAX_MEDIATIONS` held.
     Mediations,
-    /// A new mediation or message, with the store at its high water.
-    Storage,
     /// A WebSocket, with `ALMENA_MAX_SOCKETS` open.
     WebSockets,
 }
@@ -91,9 +88,8 @@ const FORWARDS: [(Forward, &str); 5] = [
     (Forward::RelayDropped, "relay_dropped"),
     (Forward::Refused, "refused"),
 ];
-const REFUSALS: [(Refusal, &str); 3] = [
+const REFUSALS: [(Refusal, &str); 2] = [
     (Refusal::Mediations, "mediations"),
-    (Refusal::Storage, "storage"),
     (Refusal::WebSockets, "websockets"),
 ];
 const RETRIES: [(Retry, &str); 3] = [
@@ -101,9 +97,7 @@ const RETRIES: [(Retry, &str); 3] = [
     (Retry::Rescheduled, "rescheduled"),
     (Retry::Abandoned, "abandoned"),
 ];
-/// Wake-ups never go to VoIP tokens; rings go to all three.
 const WAKE_SERVICES: [Service; 2] = [Service::Fcm, Service::Apns];
-const RING_SERVICES: [Service; 3] = [Service::Fcm, Service::Apns, Service::ApnsVoip];
 const PUSHES: [(Push, &str); 3] = [
     (Push::Delivered, "delivered"),
     (Push::InvalidToken, "invalid_token"),
@@ -128,17 +122,12 @@ pub struct Metrics {
     relay_rate_limited: AtomicU64,
     forwards: [AtomicU64; 5],
     relay_retries: [AtomicU64; 3],
-    pushes: [[AtomicU64; 3]; 3],
-    rings: [[AtomicU64; 3]; 3],
+    pushes: [[AtomicU64; 3]; 2],
     live_sessions: AtomicI64,
     mediations_granted: AtomicU64,
     mediations_removed: AtomicU64,
-    turn_credentials: AtomicU64,
-    capacity_refused: [AtomicU64; 3],
+    capacity_refused: [AtomicU64; 2],
     mediations: AtomicU64,
-    store_memory_used: AtomicU64,
-    store_memory_max: AtomicU64,
-    store_full: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -164,17 +153,12 @@ impl Metrics {
             relay_rate_limited: AtomicU64::new(0),
             forwards: [const { AtomicU64::new(0) }; 5],
             relay_retries: [const { AtomicU64::new(0) }; 3],
-            pushes: [const { [const { AtomicU64::new(0) }; 3] }; 3],
-            rings: [const { [const { AtomicU64::new(0) }; 3] }; 3],
+            pushes: [const { [const { AtomicU64::new(0) }; 3] }; 2],
             live_sessions: AtomicI64::new(0),
             mediations_granted: AtomicU64::new(0),
             mediations_removed: AtomicU64::new(0),
-            turn_credentials: AtomicU64::new(0),
-            capacity_refused: [const { AtomicU64::new(0) }; 3],
+            capacity_refused: [const { AtomicU64::new(0) }; 2],
             mediations: AtomicU64::new(0),
-            store_memory_used: AtomicU64::new(0),
-            store_memory_max: AtomicU64::new(0),
-            store_full: AtomicU64::new(0),
         }
     }
 
@@ -236,12 +220,6 @@ impl Metrics {
         inc(&self.pushes[service as usize][push as usize], 1);
     }
 
-    /// A call push went to one device (the wake-up an iPhone without a VoIP
-    /// token gets instead counts here, under `apns`).
-    pub fn ring(&self, service: Service, push: Push) {
-        inc(&self.rings[service as usize][push as usize], 1);
-    }
-
     pub fn websocket_opened(&self) {
         self.websockets.fetch_add(1, Ordering::Relaxed);
     }
@@ -267,10 +245,6 @@ impl Metrics {
         inc(&self.mediations_removed, count);
     }
 
-    pub fn turn_credentials(&self) {
-        inc(&self.turn_credentials, 1);
-    }
-
     pub fn capacity_refused(&self, refusal: Refusal) {
         inc(&self.capacity_refused[refusal as usize], 1);
     }
@@ -278,15 +252,6 @@ impl Metrics {
     /// Mediations held, as last sampled.
     pub fn mediations(&self, count: u64) {
         self.mediations.store(count, Ordering::Relaxed);
-    }
-
-    /// The store's memory as last sampled (0 / 0 without a ceiling), and
-    /// whether it is at its high water.
-    pub fn store_memory(&self, memory: Option<StoreMemory>, full: bool) {
-        let (used, max) = memory.map_or((0, 0), |m| (m.used, m.max));
-        self.store_memory_used.store(used, Ordering::Relaxed);
-        self.store_memory_max.store(max, Ordering::Relaxed);
-        self.store_full.store(u64::from(full), Ordering::Relaxed);
     }
 
     /// The Prometheus text exposition format (version 0.0.4).
@@ -351,7 +316,7 @@ impl Metrics {
             &mut out,
             "almena_store_errors_total",
             "counter",
-            "Store (Redis) operations that failed.",
+            "Store (SQLite) operations that failed.",
         );
         let _ = writeln!(out, "almena_store_errors_total {}", get(&self.store_errors));
 
@@ -448,23 +413,6 @@ impl Metrics {
 
         family(
             &mut out,
-            "almena_rings_total",
-            "counter",
-            "Call pushes, by service and result.",
-        );
-        for service in RING_SERVICES {
-            for (p, result) in PUSHES {
-                let _ = writeln!(
-                    out,
-                    "almena_rings_total{{service=\"{}\",result=\"{result}\"}} {}",
-                    service.as_str(),
-                    get(&self.rings[service as usize][p as usize])
-                );
-            }
-        }
-
-        family(
-            &mut out,
             "almena_websocket_connections",
             "gauge",
             "WebSocket connections open now.",
@@ -513,21 +461,9 @@ impl Metrics {
 
         family(
             &mut out,
-            "almena_turn_credentials_total",
-            "counter",
-            "TURN credentials issued.",
-        );
-        let _ = writeln!(
-            out,
-            "almena_turn_credentials_total {}",
-            get(&self.turn_credentials)
-        );
-
-        family(
-            &mut out,
             "almena_capacity_refused_total",
             "counter",
-            "New mediations, messages and WebSockets refused for want of room.",
+            "New mediations and WebSockets refused at a ceiling.",
         );
         for (r, reason) in REFUSALS {
             let _ = writeln!(
@@ -545,37 +481,6 @@ impl Metrics {
         );
         let _ = writeln!(out, "almena_mediations {}", get(&self.mediations));
 
-        family(
-            &mut out,
-            "almena_store_memory_bytes",
-            "gauge",
-            "Memory the store (Redis) uses, as last sampled.",
-        );
-        let _ = writeln!(
-            out,
-            "almena_store_memory_bytes {}",
-            get(&self.store_memory_used)
-        );
-
-        family(
-            &mut out,
-            "almena_store_memory_max_bytes",
-            "gauge",
-            "The store's memory ceiling (Redis maxmemory); 0: none.",
-        );
-        let _ = writeln!(
-            out,
-            "almena_store_memory_max_bytes {}",
-            get(&self.store_memory_max)
-        );
-
-        family(
-            &mut out,
-            "almena_store_full",
-            "gauge",
-            "1 while the store is at ALMENA_STORE_HIGH_WATER: new mediations and messages refused.",
-        );
-        let _ = writeln!(out, "almena_store_full {}", get(&self.store_full));
         out
     }
 }
@@ -629,19 +534,11 @@ mod tests {
         metrics.rate_limit_failed(false);
         metrics.relay_rate_limited();
         metrics.push(Service::Apns, Push::InvalidToken);
-        metrics.ring(Service::ApnsVoip, Push::Delivered);
         metrics.live_session_opened();
         metrics.websocket_opened();
         metrics.websocket_opened();
-        metrics.capacity_refused(Refusal::Storage);
+        metrics.capacity_refused(Refusal::WebSockets);
         metrics.mediations(7);
-        metrics.store_memory(
-            Some(StoreMemory {
-                used: 950,
-                max: 1000,
-            }),
-            true,
-        );
         metrics.message_took(Duration::from_millis(20));
         metrics.message_took(Duration::from_secs(60));
         let text = metrics.render();
@@ -656,16 +553,11 @@ mod tests {
         assert!(text.contains("almena_rate_limit_failures_total{result=\"allowed\"} 0"));
         assert!(text.contains("almena_relay_rate_limited_total 1"));
         assert!(text.contains("almena_pushes_total{service=\"apns\",result=\"invalid_token\"} 1"));
-        assert!(text.contains("almena_rings_total{service=\"apns-voip\",result=\"delivered\"} 1"));
-        assert!(!text.contains("almena_pushes_total{service=\"apns-voip\""));
         assert!(text.contains("almena_live_sessions 1"));
         assert!(text.contains("almena_websocket_connections 2"));
-        assert!(text.contains("almena_capacity_refused_total{reason=\"storage\"} 1"));
+        assert!(text.contains("almena_capacity_refused_total{reason=\"websockets\"} 1"));
         assert!(text.contains("almena_capacity_refused_total{reason=\"mediations\"} 0"));
         assert!(text.contains("almena_mediations 7"));
-        assert!(text.contains("almena_store_memory_bytes 950"));
-        assert!(text.contains("almena_store_memory_max_bytes 1000"));
-        assert!(text.contains("almena_store_full 1"));
         assert!(text.contains("almena_didcomm_message_seconds_bucket{le=\"0.01\"} 0"));
         assert!(text.contains("almena_didcomm_message_seconds_bucket{le=\"0.025\"} 1"));
         assert!(text.contains("almena_didcomm_message_seconds_bucket{le=\"10\"} 1"));

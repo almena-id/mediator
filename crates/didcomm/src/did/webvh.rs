@@ -58,7 +58,7 @@ pub fn log_url(did: &str) -> Result<String> {
         .replace("%3A", ":")
         .replace("%3a", ":");
     let path: Vec<&str> = parts.collect();
-    if host.contains(['/', '?', '#', '@']) || path.iter().any(|part| part.is_empty()) {
+    if !super::web::url_parts_hold(&host, &path) {
         return Err(bad());
     }
     Ok(if path.is_empty() {
@@ -77,6 +77,20 @@ pub fn resolve(log: &str, did: &str) -> Result<DidDocument> {
         Some(Walked::Deactivated) => Err(Error::DidNotFound(did.to_owned())),
         None => Err(Error::Resolver(format!("{did}: its log does not hold"))),
     }
+}
+
+/// Whether `text` is a time as `YYYY-MM-DDTHH:MM:SSZ`, the shape whose text
+/// order is its time order.
+fn is_utc_second(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 20
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            10 => *b == b'T',
+            13 | 16 => *b == b':',
+            19 => *b == b'Z',
+            _ => b.is_ascii_digit(),
+        })
 }
 
 /// SHA-256 as a base58btc multihash (`Qm…`): what SCIDs, entry hashes and
@@ -270,7 +284,8 @@ fn walk(log: &str, did: &str) -> Option<Walked> {
         }
 
         let when = entry.get("versionTime")?.as_str()?;
-        if when < time.as_str() {
+        // Compared as text, which holds only for one shape: UTC, to the second.
+        if !is_utc_second(when) || when < time.as_str() {
             return None;
         }
         time = when.to_owned();
@@ -294,6 +309,20 @@ mod tests {
     use crate::crypto::keys::PublicKey;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
+
+    #[test]
+    fn version_times_have_one_shape() {
+        assert!(is_utc_second("2026-10-01T00:00:00Z"));
+        for text in [
+            "2026-10-01T00:00:00",
+            "2026-10-01T00:00:00.5Z",
+            "2026-10-01 00:00:00Z",
+            "9999-99-99T99:99:99ZZ",
+            "garbage",
+        ] {
+            assert!(!is_utc_second(text), "{text}");
+        }
+    }
 
     fn written(key: &SigningKey) -> String {
         multikey::encode(

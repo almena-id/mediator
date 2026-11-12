@@ -166,7 +166,7 @@ impl Transport for HttpTransport {
 }
 
 /// Resolves names like the system does, keeping only public addresses.
-struct PublicOnlyResolver;
+pub(crate) struct PublicOnlyResolver;
 
 impl Resolve for PublicOnlyResolver {
     fn resolve(&self, name: Name) -> Resolving {
@@ -206,12 +206,17 @@ pub fn is_public(ip: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public(IpAddr::V4(v4));
             }
-            let first = v6.segments()[0];
+            let segments = v6.segments();
+            let first = segments[0];
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
+                || segments[..6] == [0; 6] // IPv4-compatible (::a.b.c.d, deprecated)
+                || segments[..4] == [0x0100, 0, 0, 0] // discard-only (100::/64)
                 || (first & 0xfe00) == 0xfc00 // unique local
                 || (first & 0xffc0) == 0xfe80 // link local
+                || (first & 0xffc0) == 0xfec0 // site local (deprecated)
+                || first == 0x2001 && segments[1] == 0 // Teredo: tunnels to any IPv4
                 || first == 0x2001 && v6.segments()[1] == 0x0db8 // documentation
                 || first == 0x2002 // 6to4: tunnels to any IPv4, private ones too
                 || v6.segments()[..2] == [0x64, 0xff9b]) // NAT64 (64:ff9b::/96, 64:ff9b:1::/48)
@@ -303,6 +308,28 @@ impl Cache {
     }
 }
 
+/// Removes a fetch from [`WebResolver::fetching`] when dropped, if it is
+/// still the one there and nobody else is waiting for it (the map's clone and
+/// this one's are all that is left).
+struct Unregister<'a> {
+    fetching: &'a Mutex<HashMap<String, Arc<OnceCell<Resolved>>>>,
+    did: &'a str,
+    cell: &'a Arc<OnceCell<Resolved>>,
+}
+
+impl Drop for Unregister<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut fetching) = self.fetching.lock()
+            && fetching
+                .get(self.did)
+                .is_some_and(|current| Arc::ptr_eq(current, self.cell))
+            && (self.cell.initialized() || Arc::strong_count(self.cell) <= 2)
+        {
+            fetching.remove(self.did);
+        }
+    }
+}
+
 impl WebResolver {
     const TTL: Duration = Duration::from_secs(300);
     /// A DID that failed is not fetched again for this long: a message
@@ -330,24 +357,23 @@ impl WebResolver {
             // A poisoned map only loses the sharing.
             Err(_) => Arc::new(OnceCell::new()),
         };
-        let result = cell
-            .get_or_init(|| async {
-                let result = self.fetch(did, web).await;
-                if let Ok(mut cache) = self.cache.lock() {
-                    cache.put(did, result.clone(), Self::CAPACITY);
-                }
-                result
-            })
-            .await
-            .clone();
-        if let Ok(mut fetching) = self.fetching.lock()
-            && fetching
-                .get(did)
-                .is_some_and(|current| Arc::ptr_eq(current, &cell))
-        {
-            fetching.remove(did);
-        }
-        result
+        // Taken off the map however this ends — also when whoever asked goes
+        // away mid-fetch and this future is dropped, or the map would keep
+        // one entry per DID a stranger made up.
+        let _unregister = Unregister {
+            fetching: &self.fetching,
+            did,
+            cell: &cell,
+        };
+        cell.get_or_init(|| async {
+            let result = self.fetch(did, web).await;
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.put(did, result.clone(), Self::CAPACITY);
+            }
+            result
+        })
+        .await
+        .clone()
     }
 
     async fn fetch(&self, did: &str, web: bool) -> almena_didcomm::Result<DidDocument> {
@@ -410,10 +436,20 @@ mod tests {
             "240.0.0.1",
             "64:ff9b::a00:1",
             "2002:a00:1::1",
+            "::7f00:1",
+            "::a00:1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "fec0::1",
+            "100::1",
         ] {
             assert!(!is_public(private.parse().unwrap()), "{private}");
         }
-        for public in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+        for public in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ] {
             assert!(is_public(public.parse().unwrap()), "{public}");
         }
     }
@@ -498,6 +534,18 @@ mod tests {
             resolver.resolve("did:example:1").await,
             Err(almena_didcomm::Error::DidNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_fetch_given_up_leaves_nothing_behind() {
+        let resolver = WebResolver::new(Arc::new(Registry(0.into())));
+        // Whoever asked goes away before the log arrives.
+        let gave_up =
+            tokio::time::timeout(Duration::from_millis(5), resolver.resolve(REGISTRY_DID)).await;
+        assert!(gave_up.is_err());
+        assert!(resolver.fetching.lock().unwrap().is_empty());
+        resolver.resolve(REGISTRY_DID).await.unwrap();
+        assert!(resolver.fetching.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

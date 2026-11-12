@@ -1,25 +1,23 @@
 //! Mediation state and message queues.
 //!
-//! [`Store`] is what the mediator needs from storage. Production uses Redis
-//! ([`RedisStore`]); [`MemoryStore`] keeps everything in the process, for
-//! tests and for `ALMENA_REDIS_URL=memory://` during development.
+//! [`Store`] is what the mediator needs from storage, kept in SQLite
+//! ([`SqliteStore`]): a file on disk, or `:memory:` for tests and
+//! development.
 //!
 //! A *mediation* is keyed by the DID the wallet used to request it. It owns a
 //! set of recipient DIDs (the ones `forward` messages may name as `next`) and
 //! one queue holding the messages for all of them, oldest first. Queue ids
-//! look like Redis stream ids (`<ms>-<seq>`) and are the attachment ids of
-//! Message Pickup deliveries.
+//! are `<ms>-<seq>` and are the attachment ids of Message Pickup deliveries.
 
-mod memory;
-mod redis;
+mod sqlite;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-pub use self::memory::MemoryStore;
-pub use self::redis::RedisStore;
+pub use self::sqlite::SqliteStore;
 use crate::push::{Device, Service};
 
 /// Result of registering a recipient DID.
@@ -28,10 +26,12 @@ pub enum AddRecipient {
     Added,
     /// Already registered by this mediation.
     AlreadyYours,
-    /// Registered by another mediation.
+    /// Registered by another mediation, or another mediation's own DID.
     TakenByOther,
     /// The mediation has as many recipient DIDs as it may.
     LimitReached,
+    /// There is no such mediation (any more).
+    NoMediation,
 }
 
 /// Result of removing a recipient DID.
@@ -63,6 +63,36 @@ pub struct QueueSummary {
     pub total_bytes: u64,
 }
 
+/// A mailbox, as the administration lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mailbox {
+    /// The mediation: the DID its wallet asked for it with.
+    pub id: String,
+    /// Epoch seconds its wallet was last active.
+    pub seen: u64,
+    /// Recipient DIDs it registered.
+    pub dids: u64,
+    /// Messages waiting in it, and their size.
+    pub messages: u64,
+    pub bytes: u64,
+    /// Devices it registered for push wake-ups.
+    pub devices: u64,
+}
+
+/// What the store holds, in all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Totals {
+    pub mailboxes: u64,
+    pub dids: u64,
+    pub messages: u64,
+    pub bytes: u64,
+    pub devices: u64,
+    /// `forward` payloads waiting to be relayed to other mediators.
+    pub relays: u64,
+    /// The most recipient DIDs one mailbox holds.
+    pub fullest: u64,
+}
+
 /// A `forward` payload waiting to be relayed to another mediator.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingRelay {
@@ -92,16 +122,6 @@ impl PendingRelay {
     }
 }
 
-/// A message queued by one mediator instance for a mediation another
-/// instance may hold a live session of (SPEC.md, Appendix E).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LiveEvent {
-    /// The instance that queued it, which has pushed it to its own sessions.
-    pub instance: String,
-    pub mediation: String,
-    pub queued: Queued,
-}
-
 /// How many relays may wait for a retry, so that destinations that stay down
 /// (or never answer) cannot fill the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,13 +132,6 @@ pub struct RelayLimits {
     pub per_destination: usize,
     /// Bytes of the relays waiting in all.
     pub bytes: u64,
-}
-
-/// How much memory the store uses, against the ceiling it is allowed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoreMemory {
-    pub used: u64,
-    pub max: u64,
 }
 
 /// Queue limits, from the configuration.
@@ -136,8 +149,6 @@ pub struct QueueLimits {
 pub trait Store: Send + Sync {
     /// Checks the store is reachable.
     async fn ping(&self) -> Result<()>;
-    /// `"redis"` or `"memory"`, for logs.
-    fn kind(&self) -> &'static str;
 
     /// Records a granted mediation (idempotent) and counts it as active now.
     /// A new one is refused (`false`) when `max` mediations are held already
@@ -145,8 +156,6 @@ pub trait Store: Send + Sync {
     async fn grant_mediation(&self, mediation: &str, now: u64, max: u64) -> Result<bool>;
     /// How many mediations are held.
     async fn mediation_count(&self) -> Result<u64>;
-    /// The store's memory against its ceiling; `None` when it has none.
-    async fn memory(&self) -> Result<Option<StoreMemory>>;
     /// The mediation's wallet did something at `now`; nothing if there is no
     /// such mediation.
     async fn touch_mediation(&self, mediation: &str, now: u64) -> Result<()>;
@@ -154,6 +163,16 @@ pub trait Store: Send + Sync {
     /// with everything they own: recipient DIDs, queue, devices. Returns them.
     async fn remove_idle_mediations(&self, cutoff: u64, limit: usize) -> Result<Vec<String>>;
     async fn has_mediation(&self, mediation: &str) -> Result<bool>;
+    /// Removes a mediation with everything it owns, as an idle one would
+    /// be; `false` if there was none.
+    async fn remove_mediation(&self, mediation: &str) -> Result<bool>;
+    /// Mailboxes, the most recently active first: `limit` of them from
+    /// `offset`, among those whose mediation or one of whose DIDs contains
+    /// `search` (all when it is empty); with how many match in all.
+    async fn mailboxes(&self, search: &str, offset: u64, limit: u64)
+    -> Result<(Vec<Mailbox>, u64)>;
+    /// What is held, in all.
+    async fn totals(&self) -> Result<Totals>;
 
     /// Registers `recipient` for `mediation`, first come first served.
     async fn add_recipient(
@@ -218,9 +237,12 @@ pub trait Store: Send + Sync {
     /// and returns the hits in that window so far.
     async fn hit(&self, key: &str, window_secs: u64, now: u64) -> Result<u64>;
 
-    /// Stores `relay` to be tried again at `due` (epoch seconds), replacing
-    /// any entry with its id. A new one is refused (`false`) when it would go
-    /// over any of the `limits`.
+    /// Stores `relay` to be tried again at `due` (epoch seconds). A retry
+    /// (`attempts` above 0) replaces the entry with its id; a first one with
+    /// the id of one already waiting leaves that as it is (`true`), so the
+    /// same `forward` sent again neither restarts its count nor sends it a
+    /// second time while it is being tried. A new one is refused (`false`)
+    /// when it would go over any of the `limits`.
     async fn schedule_relay(
         &self,
         relay: &PendingRelay,
@@ -258,40 +280,14 @@ pub trait Store: Send + Sync {
     /// The wallet picked up: the next push may go `min_interval_secs` after
     /// the last one.
     async fn release_push(&self, mediation: &str, now: u64, min_interval_secs: u64) -> Result<()>;
-    /// Takes the turn to ring the mediation for a call: `false` if a ring
-    /// went out less than `interval_secs` ago. Independent of the wake-up
-    /// turn of [`Store::claim_push`]; with an interval of 0 it always is.
-    async fn claim_ring(&self, mediation: &str, now: u64, interval_secs: u64) -> Result<bool>;
-
-    /// `instance` holds a live session for `mediation` until `now + ttl_secs`,
-    /// unless it says so again or [`Store::clear_live`] is called.
-    async fn set_live(
-        &self,
-        mediation: &str,
-        instance: &str,
-        now: u64,
-        ttl_secs: u64,
-    ) -> Result<()>;
-    /// `instance` holds no live session for `mediation` any more.
-    async fn clear_live(&self, mediation: &str, instance: &str) -> Result<()>;
-    /// The instances that hold a live session for `mediation` at `now`, sorted.
-    async fn live_instances(&self, mediation: &str, now: u64) -> Result<Vec<String>>;
-    /// Hands `event` to every instance listening ([`Store::subscribe_live`]).
-    async fn publish_live(&self, event: &LiveEvent) -> Result<()>;
-    /// The events every instance publishes, this one's too, from now on; the
-    /// subscription comes back by itself after the store drops it (what was
-    /// published meanwhile is missed, and still queued). `None` from a store
-    /// in the process, which only one instance can use.
-    fn subscribe_live(&self) -> Option<tokio::sync::mpsc::Receiver<LiveEvent>>;
 }
 
-/// Opens the store named by `url`: `memory://` for the in-process store,
-/// anything else is a Redis URL, authenticated with `password` if given.
-pub async fn open(url: &str, password: Option<&str>) -> Result<Arc<dyn Store>> {
-    if url == "memory://" {
-        Ok(Arc::new(MemoryStore::new()))
+/// Opens the SQLite database at `path`; `:memory:` keeps it in the process.
+pub fn open(path: &str) -> Result<Arc<dyn Store>> {
+    if path == ":memory:" {
+        Ok(Arc::new(SqliteStore::memory()?))
     } else {
-        Ok(Arc::new(RedisStore::connect(url, password).await?))
+        Ok(Arc::new(SqliteStore::open(Path::new(path))?))
     }
 }
 
@@ -323,7 +319,7 @@ pub(crate) mod contract {
     };
 
     pub async fn run(store: &dyn Store) {
-        // Unique names so the Redis run does not trip over earlier runs.
+        // Unique names, so runs never trip over each other.
         let tag = uuid();
         let (m1, m2) = (format!("did:peer:m1-{tag}"), format!("did:peer:m2-{tag}"));
         let (r1, r2, r3) = (
@@ -338,7 +334,6 @@ pub(crate) mod contract {
         assert!(store.grant_mediation(&m1, 100, 0).await.unwrap());
         assert!(store.grant_mediation(&m2, 100, 0).await.unwrap());
         assert!(store.has_mediation(&m1).await.unwrap());
-        store.memory().await.unwrap();
 
         // At the ceiling a new mediation is refused, one held is not.
         let held = store.mediation_count().await.unwrap();
@@ -369,6 +364,19 @@ pub(crate) mod contract {
         assert_eq!(
             store.add_recipient(&m2, &r1, 2).await.unwrap(),
             AddRecipient::TakenByOther
+        );
+        // Another mailbox's own DID is not anybody else's to register.
+        assert_eq!(
+            store.add_recipient(&m2, &m1, 2).await.unwrap(),
+            AddRecipient::TakenByOther
+        );
+        // A mailbox removed meanwhile takes no DID.
+        assert_eq!(
+            store
+                .add_recipient(&format!("did:peer:gone-{tag}"), &r3, 2)
+                .await
+                .unwrap(),
+            AddRecipient::NoMediation
         );
         assert_eq!(
             store.recipients(&m1).await.unwrap(),
@@ -602,6 +610,57 @@ pub(crate) mod contract {
             store.summary(&idle, None, now, 3600).await.unwrap().count,
             0
         );
+        // One removed on purpose goes the same way.
+        let gone = format!("did:peer:gone-{tag}");
+        let gone_r = format!("did:peer:gone-r-{tag}");
+        store.grant_mediation(&gone, now, 0).await.unwrap();
+        store.add_recipient(&gone, &gone_r, 5).await.unwrap();
+        store
+            .enqueue(&gone, &gone_r, "bye", now, LIMITS)
+            .await
+            .unwrap();
+        assert!(store.remove_mediation(&gone).await.unwrap());
+        assert!(!store.remove_mediation(&gone).await.unwrap());
+        assert!(!store.has_mediation(&gone).await.unwrap());
+        assert_eq!(store.mediation_of(&gone_r).await.unwrap(), None);
+        assert_eq!(
+            store.summary(&gone, None, now, 3600).await.unwrap().count,
+            0
+        );
+        // Listed for the administration: the busiest is found by its DID.
+        let listed = format!("did:peer:listed-{tag}");
+        let listed_r = format!("did:peer:listed-r-{tag}");
+        store.grant_mediation(&listed, now + 50, 0).await.unwrap();
+        store.add_recipient(&listed, &listed_r, 5).await.unwrap();
+        store
+            .enqueue(&listed, &listed_r, "hello", now, LIMITS)
+            .await
+            .unwrap();
+        let before = store.totals().await.unwrap();
+        assert!(before.mailboxes >= 2 && before.messages >= 1 && before.bytes >= 5);
+        assert!(before.fullest >= 1);
+        let (found, matching) = store.mailboxes(&listed_r, 0, 10).await.unwrap();
+        assert_eq!(matching, 1);
+        assert_eq!(
+            found,
+            [Mailbox {
+                id: listed.clone(),
+                seen: now + 50,
+                dids: 1,
+                messages: 1,
+                bytes: 5,
+                devices: 0,
+            }]
+        );
+        let (all, matching) = store.mailboxes("", 0, 1).await.unwrap();
+        assert_eq!(all[0].id, listed, "the most recently active first");
+        assert_eq!(matching, before.mailboxes);
+        assert_eq!(store.mailboxes("", matching, 10).await.unwrap().0, []);
+        store.remove_mediation(&listed).await.unwrap();
+        assert_eq!(
+            store.totals().await.unwrap().mailboxes,
+            before.mailboxes - 1
+        );
         // A DID freed this way can be registered again.
         assert_eq!(
             store.add_recipient(&active, &idle_r, 5).await.unwrap(),
@@ -647,6 +706,20 @@ pub(crate) mod contract {
         assert!(
             store
                 .due_relays(far + 71, 60, 10)
+                .await
+                .unwrap()
+                .contains(&relay(1))
+        );
+        // The same forward sent again while it is being tried: left as it
+        // is, not due again before its lease runs out.
+        let resent = PendingRelay {
+            attempts: 0,
+            ..relay(1)
+        };
+        assert!(store.schedule_relay(&resent, far, roomy).await.unwrap());
+        assert!(
+            !store
+                .due_relays(far + 30, 60, 10)
                 .await
                 .unwrap()
                 .contains(&relay(1))
@@ -760,10 +833,6 @@ pub(crate) mod contract {
             token: "abcd".into(),
             platform: None,
         };
-        let voip = Device {
-            token: "ef01".into(),
-            platform: None,
-        };
         assert!(store.devices(&m1).await.unwrap().is_empty());
         store
             .set_device(&m1, Service::Apns, Some(&iphone))
@@ -777,23 +846,13 @@ pub(crate) mod contract {
             .set_device(&m1, Service::Fcm, Some(&newer))
             .await
             .unwrap();
-        store
-            .set_device(&m1, Service::ApnsVoip, Some(&voip))
-            .await
-            .unwrap();
         assert_eq!(
             store.devices(&m1).await.unwrap(),
             [
                 (Service::Fcm, newer.clone()),
-                (Service::Apns, iphone.clone()),
-                (Service::ApnsVoip, voip.clone())
+                (Service::Apns, iphone.clone())
             ]
         );
-        store
-            .set_device(&m1, Service::ApnsVoip, None)
-            .await
-            .unwrap();
-        assert_eq!(store.devices(&m1).await.unwrap().len(), 2);
         store.remove_device(&m1, Service::Fcm, "t1").await.unwrap();
         assert_eq!(store.devices(&m1).await.unwrap().len(), 2);
         store.remove_device(&m1, Service::Fcm, "t2").await.unwrap();
@@ -812,32 +871,6 @@ pub(crate) mod contract {
         // Releasing with nothing claimed is harmless.
         store.release_push(&r3, now, 60).await.unwrap();
         assert!(store.claim_push(&r3, now, 3600).await.unwrap());
-
-        // Live presence: per instance, until it lapses or is cleared.
-        assert!(store.live_instances(&m1, now).await.unwrap().is_empty());
-        store.set_live(&m1, "i2", now, 60).await.unwrap();
-        store.set_live(&m1, "i1", now, 30).await.unwrap();
-        assert_eq!(store.live_instances(&m1, now).await.unwrap(), ["i1", "i2"]);
-        assert_eq!(store.live_instances(&m1, now + 45).await.unwrap(), ["i2"]);
-        // Saying so again extends it.
-        store.set_live(&m1, "i1", now + 20, 60).await.unwrap();
-        assert_eq!(
-            store.live_instances(&m1, now + 45).await.unwrap(),
-            ["i1", "i2"]
-        );
-        store.clear_live(&m1, "i2").await.unwrap();
-        store.clear_live(&m1, "i9").await.unwrap();
-        assert_eq!(store.live_instances(&m1, now).await.unwrap(), ["i1"]);
-        assert!(store.live_instances(&m2, now).await.unwrap().is_empty());
-        store.clear_live(&m1, "i1").await.unwrap();
-        assert!(store.live_instances(&m1, now).await.unwrap().is_empty());
-
-        // Rings: one per interval, whatever the wake-up turn says.
-        assert!(store.claim_ring(&m1, now, 60).await.unwrap());
-        assert!(!store.claim_ring(&m1, now + 59, 60).await.unwrap());
-        assert!(store.claim_ring(&m2, now, 60).await.unwrap());
-        assert!(store.claim_ring(&r3, now, 0).await.unwrap());
-        assert!(store.claim_ring(&r3, now, 0).await.unwrap());
     }
 
     pub(crate) fn uuid() -> String {

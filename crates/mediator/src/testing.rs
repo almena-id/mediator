@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::dispatch::{Limits, Mediator, Outcome};
 use crate::identity::Identity;
-use crate::store::{MemoryStore, QueueLimits, Store};
+use crate::store::{QueueLimits, SqliteStore, Store};
 
 pub const LIMITS: Limits = Limits {
     max_message_bytes: 64 * 1024,
@@ -21,16 +21,16 @@ pub const LIMITS: Limits = Limits {
     max_recipient_dids: 3,
     max_mediations: 0,
     push_min_interval_secs: 0,
-    push_ring_interval_secs: 0,
     // Off so tests can register any DID; the proof has tests of its own.
     recipient_proof: false,
     mediation_ttl_secs: 90 * 24 * 3600,
     relay_rate_limit: 0,
+    private: false,
 };
 
 /// A mediator at `https://mediator.example.com` with an empty in-memory store.
 pub fn mediator() -> Mediator {
-    mediator_on(Arc::new(MemoryStore::new()))
+    mediator_on(Arc::new(SqliteStore::memory().unwrap()))
 }
 
 /// A mediator at `https://mediator.example.com` on `store`.
@@ -138,9 +138,21 @@ impl Wallet {
         type_: &str,
         body: serde_json::Value,
     ) -> Message {
-        let message = Message::new(type_, body)
+        self.request_in(mediator, type_, body, None).await
+    }
+
+    /// [`Wallet::request`], answering the invitation `pthid`.
+    pub async fn request_in(
+        &self,
+        mediator: &Mediator,
+        type_: &str,
+        body: serde_json::Value,
+        pthid: Option<&str>,
+    ) -> Message {
+        let mut message = Message::new(type_, body)
             .from(&self.did)
             .header("return_route", json!("all"));
+        message.pthid = pthid.map(str::to_owned);
         let packed = self.send(mediator.identity(), message, false).await;
         match mediator.receive(&packed, None).await.unwrap() {
             Outcome::Reply(reply) => self.open(mediator.identity(), &reply).await,
@@ -153,11 +165,10 @@ impl Wallet {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pushed {
     Wake,
-    Ring,
 }
 
-/// A [`Pusher`](crate::push::Pusher) that records the wake-ups and rings it
-/// is asked for. Tokens starting with `dead` are reported invalid.
+/// A [`Pusher`](crate::push::Pusher) that records the wake-ups it is asked
+/// for. Tokens starting with `dead` are reported invalid.
 pub struct RecordingPusher {
     services: Vec<crate::push::Service>,
     sent: tokio::sync::mpsc::UnboundedSender<(Pushed, crate::push::Service, String)>,
@@ -208,14 +219,6 @@ impl crate::push::Pusher for RecordingPusher {
     ) -> anyhow::Result<crate::push::Sent> {
         Ok(self.record(Pushed::Wake, service, token))
     }
-
-    async fn ring(
-        &self,
-        service: crate::push::Service,
-        token: &str,
-    ) -> anyhow::Result<crate::push::Sent> {
-        Ok(self.record(Pushed::Ring, service, token))
-    }
 }
 
 /// A mediator at `public_url` on its own in-memory store.
@@ -225,7 +228,7 @@ pub fn mediator_at(
 ) -> Arc<Mediator> {
     Arc::new(Mediator::new(
         Identity::ephemeral(public_url).unwrap(),
-        Arc::new(MemoryStore::new()),
+        Arc::new(SqliteStore::memory().unwrap()),
         LIMITS,
         transport,
     ))
