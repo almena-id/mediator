@@ -21,8 +21,7 @@ pub mod transport;
 pub use config::Config;
 
 /// The mediator's version: `ALMENA_VERSION` when the build sets it (the
-/// Docker image's `year.month.sequence`, see `.github/workflows/docker.yml`),
-/// else the crate version.
+/// Dockerfile's build argument of that name), else the crate version.
 pub const VERSION: &str = match option_env!("ALMENA_VERSION") {
     Some(version) if !version.is_empty() => version,
     _ => env!("CARGO_PKG_VERSION"),

@@ -25,7 +25,7 @@ task smoke    # end-to-end check: mediation, a forwarded message, pickup
               # (a private mediator: task smoke -- <url> '<invitation link>')
 ```
 
-Every merge into `main` publishes the image `ghcr.io/almena-id/mediator` (amd64 and arm64) with a `year.month.sequence` version (e.g. `2026.09.1`, the sequence restarting each month), also tagged `latest` and `sha-<commit>`; the commit gets the git tag `v<version>`.
+There is no CI: images are built locally (`task up`, `task docker:build`). A build argument `ALMENA_VERSION` sets the version `/health` reports; without it, the crate's.
 
 ## Configuration
 
