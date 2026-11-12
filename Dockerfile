@@ -35,6 +35,8 @@ USER almena
 ENV ALMENA_HOST=0.0.0.0 \
     ALMENA_PORT=8080 \
     ALMENA_KEYS_PATH=/data/keys.json \
+    ALMENA_DB_PATH=/data/mediator.db \
+    ALMENA_ADMIN_DB_PATH=/data/admin.db \
     ALMENA_LOG_FORMAT=json \
     RUST_LOG=info
 EXPOSE 8080

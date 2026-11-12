@@ -9,6 +9,7 @@ use almena_didcomm::{Message, b64};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::home::{escape, layout};
 use crate::identity::Identity;
 
 pub const INVITATION: &str = "https://didcomm.org/out-of-band/2.0/invitation";
@@ -39,6 +40,15 @@ pub fn invitation(identity: &Identity) -> Message {
     message
 }
 
+/// An invitation to keep a mailbox at a private mediator: the mediator's
+/// invitation with the administrators' invitation `id` as its own, which
+/// the wallet answers as the `pthid` of its `mediate-request`.
+pub fn member_invitation(identity: &Identity, id: &str) -> Message {
+    let mut message = invitation(identity);
+    message.id = id.to_owned();
+    message
+}
+
 /// The invitation as a URL: `<origin>/oob?_oob=<base64url(JSON)>`.
 pub fn invitation_url(public_url: &str, invitation: &Message) -> String {
     format!("{public_url}{OOB_PATH}?_oob={}", encode(invitation))
@@ -55,33 +65,43 @@ fn encode(invitation: &Message) -> String {
     b64::encode(serde_json::to_string(invitation).unwrap_or_default())
 }
 
-/// The page shown when someone opens the invitation URL in a browser, with a
-/// link that opens the invitation in the wallet (`wallet_url`).
-pub fn page(did: &str, wallet_url: &str) -> String {
-    let escape = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    };
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Almena mediator</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}code{{word-break:break-all}}</style></head>
-<body>
-<h1>Almena mediator</h1>
-<p>This is an invitation to use this mediator on Almena Network.
-Open it in the Almena wallet, or scan its QR code with the wallet.</p>
-<p><a href="{wallet_url}">Open in Almena wallet</a></p>
-<p>Mediator DID: <code>{did}</code></p>
-</body></html>
-"#,
-        wallet_url = escape(wallet_url),
-        did = escape(did),
-    )
+/// The invitation an `_oob` parameter carries, if it is one of this
+/// mediator's: an Out-of-Band invitation from its DID.
+pub fn read(identity: &Identity, encoded: &str) -> Option<Message> {
+    let message: Message = serde_json::from_slice(&b64::decode(encoded).ok()?).ok()?;
+    (message.type_ == INVITATION && message.from.as_deref() == Some(identity.did.as_str()))
+        .then_some(message)
 }
+
+/// The page shown when someone opens the invitation URL in a browser, with a
+/// link that opens the invitation in the wallet (`wallet_url`); without
+/// one, a private mediator's word that it takes invited wallets only.
+pub fn page(did: &str, wallet_url: Option<&str>) -> String {
+    let offer = match wallet_url {
+        Some(wallet_url) => format!(
+            r#"<p>This is an invitation to use this mediator on Almena ID.
+Open it in the Almena wallet, or scan its QR code with the wallet.</p>
+<a class="open" href="{}">Open in Almena wallet</a>"#,
+            escape(wallet_url)
+        ),
+        None => "<p>This mediator is private: it keeps the mailboxes of the wallets its administrators invite. Ask one of them for an invitation.</p>".to_owned(),
+    };
+    let main = format!(
+        r#"<h1>Mediation invitation</h1>
+{offer}
+<p class="did">Mediator DID: <code>{did}</code></p>
+"#,
+        did = escape(did),
+    );
+    layout("Almena Mediator", PAGE_CSS, &main)
+}
+
+/// The invitation page's own styles, on top of the shared layout's.
+const PAGE_CSS: &str = r#"
+h1{margin:0;font-size:clamp(1.5rem,5vw,2rem);font-weight:600;letter-spacing:-.02em}
+p{margin:0;max-width:36rem;color:var(--muted)}
+.did{font-size:.875rem}
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -108,7 +128,26 @@ mod tests {
     }
 
     #[test]
+    fn a_member_invitation_is_the_mediators_with_its_own_id() {
+        let identity = Identity::ephemeral("https://mediator.example.com").unwrap();
+        let member = member_invitation(&identity, "abc123");
+        assert_eq!(member.id, "abc123");
+        let url = invitation_url("https://mediator.example.com", &member);
+        let encoded = url.split_once("?_oob=").unwrap().1;
+        assert_eq!(read(&identity, encoded), Some(member));
+        // Another mediator's is not ours to offer.
+        let other = Identity::ephemeral("https://other.example.com").unwrap();
+        let theirs = invitation_url("https://other.example.com", &invitation(&other));
+        assert_eq!(
+            read(&identity, theirs.split_once("?_oob=").unwrap().1),
+            None
+        );
+        assert_eq!(read(&identity, "not-base64!"), None);
+    }
+
+    #[test]
     fn page_escapes_html() {
-        assert!(page("did:x", "https://x/?a=1&b=<2>").contains("a=1&amp;b=&lt;2&gt;"));
+        assert!(page("did:x", Some("https://x/?a=1&b=<2>")).contains("a=1&amp;b=&lt;2&gt;"));
+        assert!(page("did:x", None).contains("private"));
     }
 }

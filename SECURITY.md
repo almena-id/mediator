@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately through GitHub: on
-[almena-network/mediator](https://github.com/almena-network/mediator), open the
+[almena-id/mediator](https://github.com/almena-id/mediator), open the
 **Security** tab and choose **Report a vulnerability**. Do not open a public
 issue, pull request or discussion about it.
 
@@ -30,18 +30,24 @@ In scope, among others:
   consistency between envelopes and headers, DID resolution;
 - the mediator: access to another wallet's queue or registered DIDs, recipient
   proofs, message leaks, the SSRF guard on outbound requests (federation,
-  `did:web`), rate limits and quotas, push tokens and credentials;
-- anything that exposes the mediator's private keys (`keys.json`) or secrets
-  (Redis password, FCM/APNs credentials).
+  `did:web`, the onboarding's domain check), rate limits and quotas, push
+  tokens and credentials;
+- the onboarding and the administration portal: claiming a mediator without
+  its setup code, proving a domain one does not control, signing in as
+  another administrator, sessions, invitations, a private mediator's access;
+- anything that exposes the mediator's private keys (`keys.json`), secrets
+  (FCM/APNs credentials, the setup code) or databases (`mediator.db`,
+  `admin.db`).
 
 Out of scope:
 
-- the `mediator.dev.almena.network` development setup (a local CA, no
-  authentication on Redis by default);
+- the development setup (`task dev`, `ALMENA_PUBLIC_URL`,
+  `ALMENA_OUTBOUND_ALLOW_INSECURE`) and the proxy in front of a mediator,
+  which is its operator's;
 - denial of service that needs more traffic than the configured rate limits
   let through;
 - third-party DIDComm implementations used only by the interoperability
   tests (`crates/interop`, `interop/`).
 
-The design, including what the mediator deliberately does not do, is in
-[docs/didcomm.md](docs/didcomm.md).
+The specification and design, including what the mediator deliberately does
+not do, are in [SPEC.md](SPEC.md).

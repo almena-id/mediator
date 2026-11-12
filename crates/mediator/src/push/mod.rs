@@ -1,4 +1,4 @@
-//! Push wake-ups (docs/didcomm.md §5).
+//! Push wake-ups (SPEC.md §6.4).
 //!
 //! When a message is queued for a mediation that has no live WebSocket
 //! session, the devices the wallet registered get a push that carries
@@ -82,7 +82,7 @@ pub enum Sent {
 /// Sends wake-ups.
 #[async_trait]
 pub trait Pusher: Send + Sync {
-    /// The services this pusher can send through.
+    /// The push protocols this pusher can send through.
     fn services(&self) -> &[Service];
     /// Sends one wake-up to `token`.
     async fn wake(&self, service: Service, token: &str) -> Result<Sent>;
@@ -127,44 +127,78 @@ impl Pusher for DirectPusher {
     }
 }
 
+/// Counts and logs what `service` said about one push to `device`, and
+/// forgets the token when it is no longer valid. `true` if it was delivered.
+async fn settle(
+    store: &dyn Store,
+    mediation: &str,
+    service: Service,
+    device: &Device,
+    sent: Result<Sent>,
+) -> Result<bool> {
+    let count = |push| METRICS.push(service, push);
+    let service_name = service.as_str();
+    match sent {
+        Ok(Sent::Delivered) => {
+            tracing::debug!(%mediation, service = service_name, "push sent");
+            count(Push::Delivered);
+            Ok(true)
+        }
+        Ok(Sent::InvalidToken) => {
+            count(Push::InvalidToken);
+            tracing::info!(%mediation, service = service_name, "push token rejected, removed");
+            store
+                .remove_device(mediation, service, &device.token)
+                .await?;
+            Ok(false)
+        }
+        Err(err) => {
+            count(Push::Failed);
+            tracing::warn!(%mediation, service = service_name, error = %format!("{err:#}"), "push failed");
+            Ok(false)
+        }
+    }
+}
+
 /// Wakes `mediation`'s devices unless a push already went out since the
 /// wallet last picked up. The marker of a sent push lasts at most
-/// `hold_secs`. Tokens the service rejects are forgotten.
+/// `hold_secs`; when no device was reached it is let go after
+/// `retry_secs`, so one failed send does not silence the wallet until it
+/// picks up. Tokens the service rejects are forgotten.
 pub async fn wake(
     store: &dyn Store,
     pusher: &dyn Pusher,
     mediation: &str,
     hold_secs: u64,
+    retry_secs: u64,
 ) -> Result<()> {
-    let devices: Vec<_> = store
+    let devices = offered(store, pusher, mediation).await?;
+    if devices.is_empty() || !store.claim_push(mediation, now(), hold_secs).await? {
+        return Ok(());
+    }
+    let mut reached = false;
+    for (service, device) in devices {
+        let sent = pusher.wake(service, &device.token).await;
+        reached |= settle(store, mediation, service, &device, sent).await?;
+    }
+    if !reached {
+        store.release_push(mediation, now(), retry_secs).await?;
+    }
+    Ok(())
+}
+
+/// The mediation's devices whose push protocol `pusher` can send through.
+async fn offered(
+    store: &dyn Store,
+    pusher: &dyn Pusher,
+    mediation: &str,
+) -> Result<Vec<(Service, Device)>> {
+    Ok(store
         .devices(mediation)
         .await?
         .into_iter()
         .filter(|(service, _)| pusher.services().contains(service))
-        .collect();
-    if devices.is_empty() || !store.claim_push(mediation, now(), hold_secs).await? {
-        return Ok(());
-    }
-    for (service, device) in devices {
-        match pusher.wake(service, &device.token).await {
-            Ok(Sent::Delivered) => {
-                tracing::debug!(%mediation, service = service.as_str(), "push sent");
-                METRICS.push(service, Push::Delivered);
-            }
-            Ok(Sent::InvalidToken) => {
-                METRICS.push(service, Push::InvalidToken);
-                tracing::info!(%mediation, service = service.as_str(), "push token rejected, removed");
-                store
-                    .remove_device(mediation, service, &device.token)
-                    .await?;
-            }
-            Err(err) => {
-                METRICS.push(service, Push::Failed);
-                tracing::warn!(%mediation, service = service.as_str(), error = %format!("{err:#}"), "push failed");
-            }
-        }
-    }
-    Ok(())
+        .collect())
 }
 
 /// HTTP client for FCM and APNs (HTTP/2 is negotiated with APNs).
@@ -186,4 +220,51 @@ fn pkcs8_der(pem: &str) -> Result<Vec<u8>> {
     let key = PrivatePkcs8KeyDer::from_pem_slice(pem.as_bytes())
         .context("expected a PKCS#8 private key (-----BEGIN PRIVATE KEY-----)")?;
     Ok(key.secret_pkcs8_der().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SqliteStore;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A pusher whose service is down until told otherwise.
+    struct Down(AtomicBool);
+
+    #[async_trait]
+    impl Pusher for Down {
+        fn services(&self) -> &[Service] {
+            &[Service::Fcm]
+        }
+
+        async fn wake(&self, _: Service, _: &str) -> Result<Sent> {
+            if self.0.load(Ordering::SeqCst) {
+                anyhow::bail!("FCM answered 503")
+            }
+            Ok(Sent::Delivered)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_does_not_silence_the_wallet() {
+        let store = SqliteStore::memory().unwrap();
+        let device = Device {
+            token: "token".into(),
+            platform: Some("android".into()),
+        };
+        store
+            .set_device("did:m", Service::Fcm, Some(&device))
+            .await
+            .unwrap();
+        let pusher = Down(true.into());
+        wake(&store, &pusher, "did:m", 3600, 0).await.unwrap();
+        // Nothing reached the device: the next message may wake it again.
+        assert!(store.claim_push("did:m", now(), 3600).await.unwrap());
+        store.release_push("did:m", now(), 0).await.unwrap();
+
+        pusher.0.store(false, Ordering::SeqCst);
+        wake(&store, &pusher, "did:m", 3600, 0).await.unwrap();
+        // Delivered: no more until the wallet picks up.
+        assert!(!store.claim_push("did:m", now(), 3600).await.unwrap());
+    }
 }

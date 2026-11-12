@@ -1,5 +1,5 @@
 /// Errors returned by this crate.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// Input that does not parse or breaks the DIDComm / JOSE structure rules.
     #[error("malformed: {0}")]

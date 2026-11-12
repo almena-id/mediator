@@ -50,11 +50,20 @@ pub(crate) fn decode_varint(bytes: &[u8]) -> Result<(u64, &[u8])> {
     Err(Error::malformed("multicodec varint"))
 }
 
+/// Longest base58btc text decoded: decoding takes time that grows with the
+/// square of its length, and the text often comes from a stranger's DID. A
+/// key is about 50 characters; a long-form `did:peer:4` document a few
+/// hundred to a few thousand.
+pub(crate) const MAX_BASE58_CHARS: usize = 8 * 1024;
+
 /// Decodes a multibase base58btc (`z…`) string.
 pub(crate) fn decode_base58btc(text: &str) -> Result<Vec<u8>> {
     let body = text
         .strip_prefix('z')
         .ok_or_else(|| Error::unsupported("multibase other than base58btc"))?;
+    if body.len() > MAX_BASE58_CHARS {
+        return Err(Error::malformed("base58btc text too long"));
+    }
     bs58::decode(body)
         .into_vec()
         .map_err(|_| Error::malformed("base58btc"))
@@ -97,6 +106,14 @@ mod tests {
             let key = SecretKey::generate(curve).unwrap().public_key();
             assert_eq!(decode(&encode(&key)).unwrap(), key);
         }
+    }
+
+    #[test]
+    fn overlong_base58_is_not_decoded() {
+        let long = format!("z{}", "2".repeat(MAX_BASE58_CHARS + 1));
+        assert!(decode_base58btc(&long).is_err());
+        let fits = format!("z{}", "2".repeat(64));
+        assert!(decode_base58btc(&fits).is_ok());
     }
 
     #[test]

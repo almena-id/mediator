@@ -27,10 +27,18 @@ impl<T: DidResolver + ?Sized> DidResolver for Arc<T> {
 /// Methods that resolve without any network: `did:key`, `did:peer:2` and
 /// `did:peer:4`. Short-form `did:peer:4` DIDs resolve only after their long
 /// form went through this resolver; it remembers up to [`Self::PEER4_CAPACITY`]
-/// of them, dropping them all when full.
+/// of them that resolved, the oldest going first when full (not all at once,
+/// so a flood of made-up ones does not forget every contact together).
 #[derive(Default)]
 pub struct LocalResolver {
-    peer4_long_forms: Mutex<HashMap<String, String>>,
+    peer4_long_forms: Mutex<Peer4Forms>,
+}
+
+/// Long forms by short form, and the short forms in the order remembered.
+#[derive(Default)]
+struct Peer4Forms {
+    by_short: HashMap<String, String>,
+    order: std::collections::VecDeque<String>,
 }
 
 impl LocalResolver {
@@ -46,10 +54,17 @@ impl LocalResolver {
             .peer4_long_forms
             .lock()
             .map_err(|_| Error::Resolver("peer4 cache poisoned".into()))?;
-        if map.len() >= Self::PEER4_CAPACITY {
-            map.clear();
+        if map.by_short.contains_key(&short) {
+            return Ok(());
         }
-        map.insert(short, long.to_owned());
+        while map.by_short.len() >= Self::PEER4_CAPACITY {
+            let Some(oldest) = map.order.pop_front() else {
+                break;
+            };
+            map.by_short.remove(&oldest);
+        }
+        map.order.push_back(short.clone());
+        map.by_short.insert(short, long.to_owned());
         Ok(())
     }
 }
@@ -63,13 +78,15 @@ impl DidResolver for LocalResolver {
             peer::resolve_peer2(did)
         } else if let Some(rest) = did.strip_prefix("did:peer:4") {
             if rest.contains(':') {
+                let doc = peer::resolve_peer4(did, did)?;
                 self.remember_peer4(did)?;
-                peer::resolve_peer4(did, did)
+                Ok(doc)
             } else {
                 let long = self
                     .peer4_long_forms
                     .lock()
                     .map_err(|_| Error::Resolver("peer4 cache poisoned".into()))?
+                    .by_short
                     .get(did)
                     .cloned()
                     .ok_or_else(|| Error::DidNotFound(did.to_owned()))?;

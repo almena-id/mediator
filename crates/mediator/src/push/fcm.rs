@@ -70,24 +70,29 @@ impl Fcm {
     }
 
     pub async fn wake(&self, token: &str) -> Result<Sent> {
+        self.send(json!({
+            "token": token,
+            "data": {"type": WAKE},
+            "android": {
+                "priority": "high",
+                "collapse_key": WAKE,
+                "notification": {
+                    "title_loc_key": TITLE_KEY,
+                    "body_loc_key": BODY_KEY,
+                    "tag": WAKE,
+                },
+            },
+        }))
+        .await
+    }
+
+    async fn send(&self, message: Value) -> Result<Sent> {
         let access = self.access_token().await?;
         let response = self
             .client
             .post(&self.send_url)
             .bearer_auth(access)
-            .json(&json!({"message": {
-                "token": token,
-                "data": {"type": WAKE},
-                "android": {
-                    "priority": "high",
-                    "collapse_key": WAKE,
-                    "notification": {
-                        "title_loc_key": TITLE_KEY,
-                        "body_loc_key": BODY_KEY,
-                        "tag": WAKE,
-                    },
-                },
-            }}))
+            .json(&json!({ "message": message }))
             .send()
             .await?;
         let status = response.status();
@@ -176,16 +181,30 @@ impl Fcm {
     }
 }
 
-/// FCM's way of saying the token is gone or was never valid.
+/// FCM's way of saying the token is gone or was never valid: `UNREGISTERED`,
+/// or `INVALID_ARGUMENT` about the token itself. `INVALID_ARGUMENT` alone also
+/// covers a payload FCM refuses, and a bug there must not wipe every token.
 fn is_invalid_token(error: &Value) -> bool {
-    error["error"]["details"].as_array().is_some_and(|details| {
-        details.iter().any(|detail| {
-            matches!(
-                detail["errorCode"].as_str(),
-                Some("UNREGISTERED" | "INVALID_ARGUMENT")
-            )
-        })
-    })
+    let Some(details) = error["error"]["details"].as_array() else {
+        return false;
+    };
+    let code = |wanted: &str| {
+        details
+            .iter()
+            .any(|detail| detail["errorCode"].as_str() == Some(wanted))
+    };
+    let about_the_token = details.iter().any(|detail| {
+        detail["fieldViolations"]
+            .as_array()
+            .is_some_and(|violations| {
+                violations
+                    .iter()
+                    .any(|v| v["field"].as_str() == Some("message.token"))
+            })
+    }) || error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("registration token"));
+    code("UNREGISTERED") || (code("INVALID_ARGUMENT") && about_the_token)
 }
 
 #[cfg(test)]
@@ -202,6 +221,38 @@ mod tests {
     use super::*;
 
     const KEY: &str = include_str!("testdata/fcm-test-key.pem");
+
+    #[test]
+    fn only_errors_about_the_token_drop_it() {
+        let error = |code: &str, message: &str, extra: Value| {
+            json!({"error": {"status": "INVALID_ARGUMENT", "message": message, "details": [
+                {"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError", "errorCode": code},
+                extra,
+            ]}})
+        };
+        assert!(is_invalid_token(&error("UNREGISTERED", "", json!({}))));
+        assert!(is_invalid_token(&error(
+            "INVALID_ARGUMENT",
+            "The registration token is not a valid FCM registration token",
+            json!({})
+        )));
+        assert!(is_invalid_token(&error(
+            "INVALID_ARGUMENT",
+            "Request contains an invalid argument.",
+            json!({"@type": "type.googleapis.com/google.rpc.BadRequest",
+                   "fieldViolations": [{"field": "message.token", "description": "Invalid registration token"}]})
+        )));
+        // The payload, not the token.
+        assert!(!is_invalid_token(&error(
+            "INVALID_ARGUMENT",
+            "Invalid value at 'message.android.priority'",
+            json!({"@type": "type.googleapis.com/google.rpc.BadRequest",
+                   "fieldViolations": [{"field": "message.android.priority"}]})
+        )));
+        assert!(!is_invalid_token(
+            &json!({"error": {"status": "UNAVAILABLE"}})
+        ));
+    }
 
     #[derive(Default)]
     struct Google {
@@ -234,8 +285,8 @@ mod tests {
                 post(|headers: HeaderMap, Json(body): Json<Value>| async move {
                     assert_eq!(headers["authorization"], "Bearer at-1");
                     let message = &body["message"];
-                    assert_eq!(message["data"], json!({"type": WAKE}));
                     assert_eq!(message["android"]["priority"], "high");
+                    assert_eq!(message["data"], json!({"type": WAKE}));
                     assert_eq!(message["android"]["notification"]["body_loc_key"], BODY_KEY);
                     match message["token"].as_str().unwrap() {
                         "good" => (StatusCode::OK, Json(json!({"name": "projects/x/messages/1"}))),

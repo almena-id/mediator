@@ -4,7 +4,8 @@
 //!
 //! Live messages are pushed *and* stay queued until acknowledged with
 //! `messages-received`, so a connection that drops mid-delivery loses
-//! nothing (docs/didcomm.md §5).
+//! nothing (SPEC.md D7). Sessions live in this process: the mediator runs as
+//! one instance.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -12,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 
+use crate::metrics::METRICS;
 use crate::store::Queued;
 
 /// Messages a live session can fall behind by; beyond that, pushes are
@@ -39,8 +41,7 @@ impl Session {
 
 type Subscribers = Vec<(u64, mpsc::Sender<Queued>)>;
 
-/// In-process registry of live sessions per mediation. A deployment with
-/// several mediator instances would need to fan out through Redis pub/sub.
+/// Registry of live sessions per mediation.
 #[derive(Default)]
 pub struct LiveHub {
     next_id: AtomicU64,
@@ -71,13 +72,16 @@ impl LiveHub {
                 .or_default()
                 .push((session.id, session.sender.clone()));
             session.live = Some(mediation.to_owned());
+            METRICS.live_session_opened();
         }
     }
 
+    /// Turns live mode off.
     pub fn disable(&self, session: &mut Session) {
         let Some(mediation) = session.live.take() else {
             return;
         };
+        METRICS.live_session_closed();
         if let Ok(mut sessions) = self.sessions.lock()
             && let Some(list) = sessions.get_mut(&mediation)
         {
@@ -105,6 +109,9 @@ impl LiveHub {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
             });
+            if list.is_empty() {
+                sessions.remove(mediation);
+            }
         }
     }
 }
@@ -149,13 +156,8 @@ mod tests {
         hub.enable(&mut a, "did:example:m");
         drop(a_rx);
         hub.notify("did:example:m", &queued("1-0"));
-        assert!(
-            hub.sessions
-                .lock()
-                .unwrap()
-                .get("did:example:m")
-                .unwrap()
-                .is_empty()
-        );
+        // Nothing is kept for a mediation with no session left.
+        assert!(hub.sessions.lock().unwrap().is_empty());
+        assert!(!hub.is_live("did:example:m"));
     }
 }

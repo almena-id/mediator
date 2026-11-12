@@ -11,6 +11,9 @@ use super::{Handled, Mediator};
 
 /// Most messages one `delivery` carries, whatever `limit` asks for.
 pub const MAX_BATCH: u64 = 100;
+/// Most ids one `messages-received` may acknowledge: ten deliveries' worth.
+/// Every id is a delete under the store's one connection.
+pub const MAX_ACKNOWLEDGED: usize = 1_000;
 
 /// Handles a Message Pickup message from `requester` (an authenticated DID)
 /// that arrived on `session` (a WebSocket) or over HTTP (`None`).
@@ -26,11 +29,13 @@ pub async fn handle(
     }
     // Any pickup means the wallet is awake: pushes may resume.
     mediator.picked_up(requester).await?;
-    // `recipient_did`, when given, must be one of the requester's.
+    // `recipient_did`, when given, must be one of the requester's: its own
+    // DID (where replies without a return route wait, §6.6) or one it
+    // registered.
     let recipient = match message.body.get("recipient_did") {
         None | Some(Value::Null) => None,
         Some(Value::String(did)) => {
-            if !store.recipients(requester).await?.contains(did) {
+            if did != requester && !store.recipients(requester).await?.contains(did) {
                 return Ok(Handled::Problem(Problem::UnknownRecipient(did.clone())));
             }
             Some(did.as_str())
@@ -73,6 +78,7 @@ pub async fn handle(
                 .body
                 .get("message_id_list")
                 .and_then(Value::as_array)
+                .filter(|ids| ids.len() <= MAX_ACKNOWLEDGED)
                 .and_then(|ids| {
                     ids.iter()
                         .map(|id| id.as_str().map(str::to_owned))
@@ -82,6 +88,7 @@ pub async fn handle(
                 return Ok(Handled::Problem(Problem::InvalidBody));
             };
             let removed = store.remove(requester, &ids).await?;
+            crate::metrics::METRICS.acknowledged(removed as u64);
             tracing::debug!(mediation = %requester, removed, "messages received");
             status(mediator, requester, recipient, message, live).await
         }
@@ -92,11 +99,11 @@ pub async fn handle(
             match (wanted, session) {
                 (true, None) => Ok(Handled::Problem(Problem::LiveModeNotSupported)),
                 (true, Some(session)) => {
-                    mediator.live().enable(session, requester);
+                    mediator.go_live(session, requester);
                     status(mediator, requester, recipient, message, true).await
                 }
                 (false, Some(session)) => {
-                    mediator.live().disable(session);
+                    mediator.leave_live(session);
                     status(mediator, requester, recipient, message, false).await
                 }
                 (false, None) => status(mediator, requester, recipient, message, false).await,

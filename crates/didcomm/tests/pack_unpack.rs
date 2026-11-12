@@ -545,3 +545,32 @@ async fn forward_can_be_turned_off() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_route_is_neither_long_nor_circular() {
+    let resolver = LocalResolver::new();
+    let hop = Party::new(Curve::X25519);
+    let alice = Party::new(Curve::X25519);
+    let kid = hop.agreement_kid();
+    for keys in [
+        vec![kid.as_str(); almena_didcomm::MAX_ROUTING_HOPS + 1],
+        vec![kid.as_str(), kid.as_str()],
+    ] {
+        let bob = Party::with_services(
+            Curve::X25519,
+            &[didcomm_service("https://hop.example/didcomm", &keys)],
+        );
+        let err = ping(&alice, &bob)
+            .pack_encrypted(
+                &bob.did,
+                None,
+                None,
+                &resolver,
+                &alice.secrets,
+                PackOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    }
+}

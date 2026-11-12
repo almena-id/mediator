@@ -1,24 +1,24 @@
 # Contributing
 
-Thanks for helping with the Almena Network mediator. By taking part you agree
+Thanks for helping with the Almena ID mediator. By taking part you agree
 to follow the [Code of Conduct](CODE_OF_CONDUCT.md). Security issues go
 through [SECURITY.md](SECURITY.md), never through public issues.
 
 ## Getting started
 
-You need a recent stable Rust, [Task](https://taskfile.dev) and Docker (for
-Redis and the full stack).
+You need a recent stable Rust, [Task](https://taskfile.dev) and, for the
+full stack, Docker. Storage is SQLite, built in.
 
 ```bash
 task init        # creates .env from .env.example
-task dev:memory  # runs the mediator without Docker, everything in memory
-task dev         # runs it against Redis in Docker
-task up          # the full stack in Docker, behind Caddy
+task dev         # runs the mediator, its database in data/mediator.db
+task dev:memory  # the same, everything in memory
+task up          # the mediator in Docker (the proxy in front is the operator's)
 task --list      # everything else
 ```
 
 [README.md](README.md) lists the configuration and endpoints;
-[docs/didcomm.md](docs/didcomm.md) is the design. Read the design before
+[SPEC.md](SPEC.md) is the specification and the design. Read it before
 changing anything DIDComm-related, and keep it current with your change.
 
 ## Making a change
@@ -31,8 +31,8 @@ changing anything DIDComm-related, and keep it current with your change.
 - Every endpoint of the public router is declared with `#[utoipa::path]`, so it
   shows up in `/openapi.json` and `/docs`; keep the README endpoint table in
   sync.
-- New behaviour comes with tests. Storage changes go into the shared contract
-  test that both stores run; run it against Redis with `task test:redis`.
+- New behaviour comes with tests. Storage changes go into the store's contract
+  test (`store/mod.rs`).
 - Before sending a change, `task check` must pass: formatting, clippy with
   warnings as errors, and all tests.
 

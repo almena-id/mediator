@@ -181,6 +181,12 @@ impl Message {
     }
 }
 
+/// Routing hops [`route`] wraps a message for, the mediator named by a DID
+/// endpoint included. Each hop grows the message by about a third, so a
+/// stranger's DID document must not decide how many there are; DIDComm's own
+/// examples have one or two.
+pub const MAX_ROUTING_HOPS: usize = 4;
+
 /// A message made ready for transport by [`route`].
 #[derive(Debug, Clone)]
 pub struct Routed {
@@ -202,7 +208,8 @@ pub struct Routed {
 /// `uri` is a DID (spec: "Using a DID as an endpoint"), that DID is a
 /// mediator: its `keyAgreement` keys go first in the routing keys, and the
 /// transport URI comes from its own service. Each routing key, from last to
-/// first, gets a `forward` whose `next` is the hop after it.
+/// first, gets a `forward` whose `next` is the hop after it. More than
+/// [`MAX_ROUTING_HOPS`] hops, or one named twice, is refused.
 pub async fn route(
     mut packed: String,
     to: &str,
@@ -235,6 +242,19 @@ pub async fn route(
     } else {
         endpoint.uri
     };
+    if routing_keys.len() > MAX_ROUTING_HOPS {
+        return Err(Error::unsupported(format!(
+            "a route of {} hops (at most {MAX_ROUTING_HOPS})",
+            routing_keys.len()
+        )));
+    }
+    if routing_keys
+        .iter()
+        .enumerate()
+        .any(|(i, hop)| routing_keys[..i].contains(hop))
+    {
+        return Err(Error::unsupported("a route through the same hop twice"));
+    }
 
     for (i, hop) in routing_keys.iter().enumerate().rev() {
         let next = routing_keys.get(i + 1).map_or(recipient, String::as_str);

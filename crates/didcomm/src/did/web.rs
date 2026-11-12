@@ -25,6 +25,19 @@ pub fn did_from_origin(origin: &str) -> Result<String> {
     ))
 }
 
+/// Checks the host and path segments a `did:web` or `did:webvh` names
+/// before they become a URL: the host carries no userinfo, path, query or
+/// fragment, and no segment is empty, `.`, `..` or holds any of those.
+pub(crate) fn url_parts_hold(host: &str, path: &[&str]) -> bool {
+    const NOT_IN_URL: [char; 6] = ['/', '?', '#', '@', '\\', '%'];
+    let clean = |part: &str| !part.contains(NOT_IN_URL) && !part.chars().any(char::is_whitespace);
+    !host.is_empty()
+        && clean(host)
+        && path
+            .iter()
+            .all(|part| !part.is_empty() && *part != "." && *part != ".." && clean(part))
+}
+
 /// The HTTPS URL of a `did:web` document.
 pub fn document_url(did: &str) -> Result<String> {
     let id = did
@@ -38,8 +51,10 @@ pub fn document_url(did: &str) -> Result<String> {
         .replace("%3A", ":")
         .replace("%3a", ":");
     let path: Vec<&str> = parts.collect();
-    if path.iter().any(|p| p.is_empty()) {
-        return Err(Error::malformed("did:web with an empty path segment"));
+    if !url_parts_hold(&host, &path) {
+        return Err(Error::malformed(
+            "did:web with a host or path segment that is no URL part",
+        ));
     }
     Ok(if path.is_empty() {
         format!("https://{host}/.well-known/did.json")
@@ -90,5 +105,22 @@ mod tests {
             document_url("did:web:example.com%3A3000:user:alice").unwrap(),
             "https://example.com:3000/user/alice/did.json"
         );
+    }
+
+    #[test]
+    fn dids_that_would_bend_the_url_are_refused() {
+        for did in [
+            "did:web:user@10.0.0.1",
+            "did:web:example.com:..:admin",
+            "did:web:example.com:.",
+            "did:web:example.com:a%2Fb",
+            "did:web:example.com:a?b",
+            "did:web:example.com:a#b",
+            "did:web:example.com:a b",
+            "did:web:example.com:a\\b",
+            "did:web:example.com::x",
+        ] {
+            assert!(document_url(did).is_err(), "{did}");
+        }
     }
 }

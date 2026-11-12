@@ -26,7 +26,7 @@ use almena_didcomm::{
 };
 use almena_mediator::dispatch::{Limits, Mediator, Outcome};
 use almena_mediator::identity::Identity;
-use almena_mediator::store::{MemoryStore, QueueLimits};
+use almena_mediator::store::{QueueLimits, SqliteStore};
 use serde_json::{Value, json};
 
 const TYPE: &str = "https://example.com/protocols/interop/1.0/hello";
@@ -275,9 +275,12 @@ const LIMITS: Limits = Limits {
         max_bytes: 1024 * 1024,
     },
     max_recipient_dids: 3,
+    max_mediations: 0,
     push_min_interval_secs: 60,
     recipient_proof: true,
     mediation_ttl_secs: 0,
+    relay_rate_limit: 0,
+    private: false,
 };
 
 /// The mediator's key agreement key on `curve`, as a kid and Affinidi key.
@@ -340,7 +343,7 @@ async fn a_mediation_run_with_affinidi_wallets() {
     for curve in [Curve::X25519, Curve::P384] {
         let mediator = Mediator::new(
             Identity::ephemeral("https://mediator.example.com").unwrap(),
-            Arc::new(MemoryStore::new()),
+            Arc::new(SqliteStore::memory().unwrap()),
             LIMITS,
             None,
         );

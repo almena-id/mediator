@@ -3,8 +3,7 @@
 //! (`sub`) and when (`iat`).
 //!
 //! Not part of DIDComm. Almena uses it to show a mediator that the DID a
-//! wallet registers as a recipient is the wallet's own (docs/didcomm.md,
-//! "Recipient proof").
+//! wallet registers as a recipient is the wallet's own (SPEC.md §6.2).
 
 use serde::{Deserialize, Serialize};
 

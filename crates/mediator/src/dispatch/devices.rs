@@ -47,26 +47,30 @@ pub async fn handle(
 
     match name {
         SET_DEVICE_INFO => {
-            let Some(device) = parse_device(service, &message.body) else {
+            let Some(devices) = parse_devices(service, &message.body) else {
                 return Ok(Handled::Problem(Problem::InvalidBody));
             };
-            store
-                .set_device(requester, service, device.as_ref())
-                .await?;
-            tracing::debug!(mediation = %requester, service = service.as_str(), registered = device.is_some(), "device info set");
+            for (service, device) in devices {
+                store
+                    .set_device(requester, service, device.as_ref())
+                    .await?;
+                tracing::debug!(mediation = %requester, service = service.as_str(), registered = device.is_some(), "device info set");
+            }
             Ok(Handled::Reply(
                 Message::new(ACK, json!({"status": "OK"})).reply_to(message),
             ))
         }
         GET_DEVICE_INFO => {
-            let device = store
-                .devices(requester)
-                .await?
-                .into_iter()
-                .find_map(|(s, device)| (s == service).then_some(device));
-            let mut body = json!({"device_token": device.as_ref().map(|d| d.token.as_str())});
+            let devices = store.devices(requester).await?;
+            let device = |wanted: Service| {
+                devices
+                    .iter()
+                    .find_map(|(s, device)| (*s == wanted).then_some(device))
+            };
+            let mut body = json!({"device_token": device(service).map(|d| &d.token)});
             if service == Service::Fcm {
-                body["device_platform"] = json!(device.and_then(|d| d.platform));
+                body["device_platform"] =
+                    json!(device(service).and_then(|d| d.platform.as_deref()));
             }
             let info = Message::new(format!("{}{DEVICE_INFO}", push_protocol(service)), body);
             Ok(Handled::Reply(info.reply_to(message)))
@@ -75,36 +79,40 @@ pub async fn handle(
     }
 }
 
-/// The device a `set-device-info` body registers: `Some(None)` removes it,
-/// `None` means the body is not valid.
-fn parse_device(service: Service, body: &Value) -> Option<Option<Device>> {
+/// The devices a `set-device-info` body registers, by service: `None` for a
+/// service removes its device; `None` overall means the body is not valid.
+fn parse_devices(service: Service, body: &Value) -> Option<Vec<(Service, Option<Device>)>> {
     // A missing field counts as `null`.
     let field = |name: &str| match body.get(name) {
         None | Some(Value::Null) => Some(None),
         Some(Value::String(value)) => Some(Some(value.as_str())),
         Some(_) => None,
     };
+    let apns = |token: Option<&str>| match token {
+        None => Some(None),
+        Some(token) if is_apns_token(token) => Some(Some(Device {
+            token: token.to_owned(),
+            platform: None,
+        })),
+        Some(_) => None,
+    };
     let token = field("device_token")?;
     match service {
-        Service::Apns => match token {
-            None => Some(None),
-            Some(token) if is_apns_token(token) => Some(Some(Device {
-                token: token.to_owned(),
-                platform: None,
-            })),
-            Some(_) => None,
-        },
+        Service::Apns => Some(vec![(Service::Apns, apns(token)?)]),
         Service::Fcm => match (token, field("device_platform")?) {
-            (None, None) => Some(None),
+            (None, None) => Some(vec![(Service::Fcm, None)]),
             (Some(token), Some(platform))
                 if is_fcm_token(token)
                     && !platform.is_empty()
                     && platform.len() <= MAX_PLATFORM =>
             {
-                Some(Some(Device {
-                    token: token.to_owned(),
-                    platform: Some(platform.to_owned()),
-                }))
+                Some(vec![(
+                    Service::Fcm,
+                    Some(Device {
+                        token: token.to_owned(),
+                        platform: Some(platform.to_owned()),
+                    }),
+                )])
             }
             // Only one of the two is `null`: the RFC allows a problem report.
             _ => None,
@@ -129,20 +137,24 @@ mod tests {
 
     #[test]
     fn device_bodies() {
-        let fcm = |body| parse_device(Service::Fcm, &body);
-        let apns = |body| parse_device(Service::Apns, &body);
+        let fcm = |body| parse_devices(Service::Fcm, &body);
+        let apns = |body| parse_devices(Service::Apns, &body);
+        let device = |token: &str, platform: Option<&str>| Device {
+            token: token.into(),
+            platform: platform.map(Into::into),
+        };
         assert_eq!(
             fcm(json!({"device_token": "tok:en", "device_platform": "android"})),
-            Some(Some(Device {
-                token: "tok:en".into(),
-                platform: Some("android".into())
-            }))
+            Some(vec![(
+                Service::Fcm,
+                Some(device("tok:en", Some("android")))
+            )])
         );
         assert_eq!(
             fcm(json!({"device_token": null, "device_platform": null})),
-            Some(None)
+            Some(vec![(Service::Fcm, None)])
         );
-        assert_eq!(fcm(json!({})), Some(None));
+        assert_eq!(fcm(json!({})), Some(vec![(Service::Fcm, None)]));
         assert_eq!(
             fcm(json!({"device_token": "t", "device_platform": null})),
             None
@@ -158,12 +170,12 @@ mod tests {
 
         assert_eq!(
             apns(json!({"device_token": "a1B2"})),
-            Some(Some(Device {
-                token: "a1B2".into(),
-                platform: None
-            }))
+            Some(vec![(Service::Apns, Some(device("a1B2", None)))])
         );
-        assert_eq!(apns(json!({"device_token": null})), Some(None));
+        assert_eq!(
+            apns(json!({"device_token": null})),
+            Some(vec![(Service::Apns, None)])
+        );
         assert_eq!(apns(json!({"device_token": "../3/device/x"})), None);
         assert_eq!(apns(json!({"device_token": ""})), None);
     }

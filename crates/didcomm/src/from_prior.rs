@@ -77,8 +77,30 @@ impl FromPrior {
         }
         let doc = resolver.resolve(&claims.iss).await?;
         jwt.verify(doc.authentication_key(&kid)?)?;
+        claims.in_force(crate::message::now())?;
         Ok((claims, kid))
     }
+
+    /// Refuses a rotation whose `exp` has passed or whose `nbf` has not
+    /// come, give or take [`Self::LEEWAY_SECS`] of clock difference.
+    fn in_force(&self, now: u64) -> Result<()> {
+        if self
+            .exp
+            .is_some_and(|exp| exp.saturating_add(Self::LEEWAY_SECS) < now)
+        {
+            return Err(Error::malformed("from_prior has expired"));
+        }
+        if self
+            .nbf
+            .is_some_and(|nbf| nbf > now.saturating_add(Self::LEEWAY_SECS))
+        {
+            return Err(Error::malformed("from_prior is not valid yet"));
+        }
+        Ok(())
+    }
+
+    /// Clock difference allowed on `exp` and `nbf`.
+    const LEEWAY_SECS: u64 = 300;
 
     fn check(&self) -> Result<()> {
         if self.iss == self.sub {
@@ -88,5 +110,23 @@ impl FromPrior {
             return Err(Error::malformed("from_prior iss and sub must be DIDs"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rotation_is_taken_only_while_in_force() {
+        let mut claims = FromPrior::new("did:example:old", "did:example:new");
+        assert!(claims.in_force(1_000).is_ok());
+        claims.exp = Some(1_000);
+        assert!(claims.in_force(1_000 + FromPrior::LEEWAY_SECS).is_ok());
+        assert!(claims.in_force(1_001 + FromPrior::LEEWAY_SECS).is_err());
+        claims.exp = Some(u64::MAX);
+        claims.nbf = Some(10_000);
+        assert!(claims.in_force(10_000 - FromPrior::LEEWAY_SECS).is_ok());
+        assert!(claims.in_force(9_999 - FromPrior::LEEWAY_SECS).is_err());
     }
 }

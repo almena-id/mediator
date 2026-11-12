@@ -1,20 +1,23 @@
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
 use tower_http::trace::TraceLayer;
 use utoipa::openapi::OpenApi as OpenApiDoc;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
-use utoipa_scalar::{Scalar, Servable};
+use utoipa_scalar::Scalar;
 
+use crate::config::{IpNet, OnError};
 use crate::dispatch::{Mediator, Outcome, ReceiveError};
 use crate::store::Store;
 use crate::{home, oob};
@@ -30,11 +33,12 @@ const ENCRYPTED: &str = "application/didcomm-encrypted+json";
 #[openapi(
     info(
         title = "Almena mediator",
-        description = "HTTP endpoints published by an Almena Network mediator (DIDComm Messaging v2.0)."
+        description = "HTTP endpoints published by an Almena ID mediator (DIDComm Messaging v2.0)."
     ),
     tags(
         (name = "didcomm", description = "DIDComm Messaging transport and the mediator's DID"),
-        (name = "operations", description = "Service health and metadata")
+        (name = "operations", description = "Service health and metadata"),
+        (name = "portal", description = "The administration portal and signing in with the Almena wallet")
     )
 )]
 struct ApiDoc;
@@ -46,10 +50,120 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     /// `POST /didcomm` requests per minute per client IP; 0 = no limit.
     pub rate_limit: u64,
+    /// Whether a request the store could not count goes through.
+    pub rate_limit_on_error: OnError,
     /// Header with the client IP set by a reverse proxy (see `Config`).
     pub client_ip_header: Option<HeaderName>,
+    /// Peers whose [`AppState::client_ip_header`] is believed.
+    pub trusted_proxies: Arc<[IpNet]>,
     /// The mediator's public origin (`ALMENA_PUBLIC_URL`).
     pub public_url: String,
+    /// Open WebSockets, per client (see [`client_key`]) and in all.
+    pub sockets: Arc<Sockets>,
+    /// Turns `true` when the mediator is shutting down: open WebSockets are
+    /// closed (`1001`, going away) so that they do not hold the shutdown up.
+    pub stopping: tokio::sync::watch::Receiver<bool>,
+    /// The administration: the site, its administrators and their sessions.
+    pub admin: Arc<crate::admin::AdminStore>,
+    /// Sign-in requests waiting for a wallet.
+    pub signins: Arc<crate::signin::SignIns>,
+    /// The URL comes from `ALMENA_PUBLIC_URL`, so it is moved there, not
+    /// from the portal.
+    pub url_pinned: bool,
+    /// Plain HTTP for the HTTPS check of a domain being proven
+    /// (`ALMENA_OUTBOUND_ALLOW_INSECURE`).
+    pub allow_insecure: bool,
+    /// Notified when the site moved: the mediator restarts as its new
+    /// `did:web`.
+    pub restart: Arc<tokio::sync::Notify>,
+}
+
+/// WebSockets open at once per client, at most.
+pub const MAX_SOCKETS_PER_CLIENT: usize = 16;
+/// The mediator pings an idle socket this often; a socket that sends nothing,
+/// not even the pong, for [`SOCKET_IDLE`] is closed.
+const SOCKET_PING: Duration = Duration::from_secs(30);
+const SOCKET_IDLE: Duration = Duration::from_secs(90);
+
+/// Open WebSockets, by client and in all.
+pub struct Sockets {
+    open: Mutex<OpenSockets>,
+    /// At most this many in all (`ALMENA_MAX_SOCKETS`).
+    max: usize,
+}
+
+#[derive(Default)]
+struct OpenSockets {
+    by_client: HashMap<IpAddr, usize>,
+    total: usize,
+}
+
+/// Why a WebSocket was not opened.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketRefused {
+    /// The client has [`MAX_SOCKETS_PER_CLIENT`] open.
+    Client,
+    /// The mediator has as many open as it takes.
+    Full,
+}
+
+impl Sockets {
+    pub fn new(max: usize) -> Self {
+        Self {
+            open: Mutex::default(),
+            max,
+        }
+    }
+
+    /// Counts one more socket for `client` (none when its address is
+    /// unknown), unless it already has [`MAX_SOCKETS_PER_CLIENT`] or the
+    /// mediator has `max`; the guard counts it out when dropped.
+    fn open(self: &Arc<Self>, client: Option<IpAddr>) -> Result<SocketGuard, SocketRefused> {
+        let mut open = self.open.lock().map_err(|_| SocketRefused::Full)?;
+        if open.total >= self.max {
+            return Err(SocketRefused::Full);
+        }
+        if let Some(client) = client {
+            let count = open.by_client.entry(client).or_default();
+            if *count >= MAX_SOCKETS_PER_CLIENT {
+                return Err(SocketRefused::Client);
+            }
+            *count += 1;
+        }
+        open.total += 1;
+        Ok(SocketGuard {
+            sockets: Arc::clone(self),
+            client,
+        })
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        let open = self.open.lock().unwrap();
+        open.total == 0 && open.by_client.is_empty()
+    }
+}
+
+struct SocketGuard {
+    sockets: Arc<Sockets>,
+    client: Option<IpAddr>,
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let Ok(mut open) = self.sockets.open.lock() else {
+            return;
+        };
+        open.total = open.total.saturating_sub(1);
+        if let Some(client) = &self.client
+            && let Some(count) = open.by_client.get_mut(client)
+        {
+            *count -= 1;
+            if *count == 0 {
+                open.by_client.remove(client);
+            }
+        }
+    }
 }
 
 /// The mediator's HTTP router. Every endpoint is registered through
@@ -60,12 +174,37 @@ pub fn router(state: AppState) -> Router {
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(home_page))
         .routes(routes!(icon))
+        .routes(routes!(font))
         .routes(routes!(receive))
         .routes(routes!(websocket))
         .routes(routes!(did_document))
+        .routes(routes!(security_txt))
         .routes(routes!(invitation))
         .routes(routes!(invitation_page))
         .routes(routes!(health))
+        .routes(routes!(crate::portal::setup, crate::portal::claim))
+        .routes(routes!(crate::portal::portal))
+        .routes(routes!(crate::portal::sign_in_status))
+        .routes(routes!(crate::portal::renew_sign_in))
+        .routes(routes!(crate::portal::sign_out))
+        .routes(routes!(crate::portal::read_request))
+        .routes(routes!(crate::portal::answer_request))
+        .routes(routes!(crate::portal::create_invitation))
+        .routes(routes!(crate::portal::invite_admin))
+        .routes(routes!(crate::portal::show_invitation))
+        .routes(routes!(crate::portal::withdraw_invitation))
+        .routes(routes!(crate::portal::remove_member))
+        .routes(routes!(crate::portal::remove_admin))
+        .routes(routes!(crate::portal::join))
+        .routes(routes!(crate::portal::mailboxes))
+        .routes(routes!(crate::portal::remove_mailbox))
+        .routes(routes!(crate::portal::members))
+        .routes(routes!(crate::portal::admins))
+        .routes(routes!(crate::portal::site))
+        .routes(routes!(crate::portal::move_url))
+        .routes(routes!(crate::portal::check_move))
+        .routes(routes!(crate::portal::cancel_move))
+        .routes(routes!(crate::portal::domain_proof))
         .with_state(state)
         .split_for_parts();
     router
@@ -76,32 +215,35 @@ pub fn router(state: AppState) -> Router {
 
 /// Home page
 ///
-/// What a browser shows at the mediator's root: its icon and name, and the
+/// What a browser shows at the mediator's root: the
 /// status, version and DID that `/health` also reports, and the mediation
-/// invitation as a QR code for the wallet.
+/// invitation as a QR code for the wallet. Until the onboarding is over —
+/// while the mediator has no administrator — it leads to `/setup`.
 #[utoipa::path(
     get,
     path = "/",
     tag = "operations",
-    responses((status = 200, description = "HTML page", content_type = "text/html"))
+    responses(
+        (status = 200, description = "HTML page", content_type = "text/html"),
+        (status = 303, description = "To the onboarding, while there is no administrator")
+    )
 )]
-async fn home_page(State(state): State<AppState>) -> Html<String> {
+async fn home_page(State(state): State<AppState>) -> Response {
+    if state.admin.admin_count().is_ok_and(|count| count == 0) {
+        return Redirect::to("/setup").into_response();
+    }
     let healthy = state.store.ping().await.is_ok();
     let identity = state.mediator.identity();
     let invitation = oob::invitation(identity);
     let url = oob::invitation_url(&state.public_url, &invitation);
-    Html(home::page(
-        healthy,
-        crate::VERSION,
-        &identity.did,
-        &url,
-        &oob::wallet_url(&invitation),
-    ))
+    let wallet = oob::wallet_url(&invitation);
+    let offer = (!state.mediator.limits().private).then_some((url.as_str(), wallet.as_str()));
+    Html(home::page(healthy, crate::VERSION, &identity.did, offer)).into_response()
 }
 
 /// Icon
 ///
-/// The mediator's icon, used by the home page and as its favicon.
+/// The mediator's icon, the favicon of its pages.
 #[utoipa::path(
     get,
     path = "/icon.png",
@@ -118,11 +260,54 @@ async fn icon() -> impl IntoResponse {
     )
 }
 
+/// Font
+///
+/// One of the typefaces the mediator's pages use (WOFF2, SIL Open Font
+/// License), served by the mediator itself so a page never calls a third party.
+#[utoipa::path(
+    get,
+    path = "/fonts/{name}",
+    tag = "operations",
+    params(("name" = String, Path, description = "Font file, e.g. `inter.woff2`")),
+    responses(
+        (status = 200, description = "WOFF2 font", content_type = "font/woff2"),
+        (status = 404, description = "No such font")
+    )
+)]
+async fn font(Path(name): Path<String>) -> Response {
+    match home::font(&name) {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "font/woff2"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn docs(api: OpenApiDoc) -> Router {
     let json = Json(api.clone());
+    // utoipa-scalar's page declares no favicon; the mediator's icon goes in
+    // its head so the tab keeps it on the reference too.
+    let page = Html(
+        Scalar::new(api)
+            .title("Almena mediator API")
+            .to_html()
+            .replacen(
+                "</head>",
+                &format!(
+                    r#"<link rel="icon" type="image/png" href="{}"/></head>"#,
+                    home::ICON_PATH
+                ),
+                1,
+            ),
+    );
     Router::new()
         .route(OPENAPI_PATH, get(move || async move { json }))
-        .merge(Scalar::with_url(DOCS_PATH, api).title("Almena mediator API"))
+        .route(DOCS_PATH, get(move || async move { page }))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -164,9 +349,9 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
         (status = 404, description = "A `forward` for a recipient DID this mediator does not mediate", body = ErrorBody),
         (status = 413, description = "Larger than the mediator accepts (see `max_receive_bytes` in Discover Features)"),
         (status = 415, description = "Content-Type is not `application/didcomm-encrypted+json`", body = ErrorBody),
-        (status = 429, description = "Too many requests from this client IP; retry after the `Retry-After` seconds"),
-        (status = 503, description = "Storage unavailable; retry later", body = ErrorBody),
-        (status = 507, description = "The forward's recipient queue is full", body = ErrorBody)
+        (status = 429, description = "Too many requests from this client IP, or relays to the recipient's mediator; retry after the `Retry-After` seconds"),
+        (status = 503, description = "Storage unavailable (also for counting the request against the rate limit); retry later", body = ErrorBody),
+        (status = 507, description = "The forward's recipient queue is full, or the mediator is out of storage", body = ErrorBody)
     )
 )]
 async fn receive(
@@ -203,6 +388,13 @@ async fn receive(
         Err(err @ ReceiveError::QueueFull) => {
             error(StatusCode::INSUFFICIENT_STORAGE, err.to_string())
         }
+        Err(err @ ReceiveError::RelayRateLimited) => {
+            let mut response = error(StatusCode::TOO_MANY_REQUESTS, err.to_string());
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(RATE_WINDOW_SECS));
+            response
+        }
         Err(ReceiveError::Store(err)) => {
             tracing::error!(error = %format!("{err:#}"), "storage failed");
             error(
@@ -215,15 +407,22 @@ async fn receive(
 
 const RATE_WINDOW_SECS: u64 = 60;
 
-/// `429` once the client IP went over the per-minute limit. Storage errors
-/// let the request through: better unlimited than unavailable.
+/// `429` once the client IP went over the per-minute limit; `503` when the
+/// store could not count the request and the limit fails closed.
 async fn rate_limited(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
 ) -> Option<Response> {
-    let ip = client_ip(headers, state.client_ip_header.as_ref(), peer);
-    over_limit(state, ip).await.then(too_many_requests)
+    let ip = client_ip(headers, state, peer);
+    match over_limit(state, ip).await {
+        Verdict::Allowed => None,
+        Verdict::Limited => Some(too_many_requests()),
+        Verdict::Unavailable => Some(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage unavailable, retry later",
+        )),
+    }
 }
 
 fn too_many_requests() -> Response {
@@ -234,16 +433,28 @@ fn too_many_requests() -> Response {
         .into_response()
 }
 
-/// Counts one DIDComm message from `ip` and says whether it is over the
-/// limit. HTTP requests and WebSocket messages share the budget.
-async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
+/// What the rate limit says about one more message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Allowed,
+    /// Over the limit.
+    Limited,
+    /// The store could not count it, and the limit fails closed.
+    Unavailable,
+}
+
+/// Counts one DIDComm message from `ip` and says whether it may go on.
+/// HTTP requests and WebSocket messages share the budget. When the store
+/// fails, `ALMENA_RATE_LIMIT_ON_ERROR` decides; either way it is logged and
+/// counted (`almena_rate_limit_failures_total`).
+async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> Verdict {
     let (Some(ip), true) = (ip, state.rate_limit > 0) else {
-        return false;
+        return Verdict::Allowed;
     };
     match state
         .store
         .hit(
-            &format!("didcomm:{ip}"),
+            &format!("didcomm:{}", client_key(ip)),
             RATE_WINDOW_SECS,
             almena_didcomm::message::now(),
         )
@@ -251,12 +462,23 @@ async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
     {
         Ok(hits) if hits > state.rate_limit => {
             crate::metrics::METRICS.rate_limited();
-            true
+            Verdict::Limited
         }
-        Ok(_) => false,
+        Ok(_) => Verdict::Allowed,
         Err(err) => {
-            tracing::warn!(error = %format!("{err:#}"), "rate limit check failed");
-            false
+            let open = state.rate_limit_on_error == OnError::Open;
+            crate::metrics::METRICS.store_error();
+            crate::metrics::METRICS.rate_limit_failed(open);
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                outcome = if open { "allowed" } else { "refused" },
+                "rate limit check failed"
+            );
+            if open {
+                Verdict::Allowed
+            } else {
+                Verdict::Unavailable
+            }
         }
     }
 }
@@ -275,7 +497,8 @@ async fn over_limit(state: &AppState, ip: Option<IpAddr>) -> bool {
     tag = "didcomm",
     responses(
         (status = 101, description = "Switching to the WebSocket protocol"),
-        (status = 429, description = "Too many requests from this client IP")
+        (status = 429, description = "Too many requests or sockets from this client IP"),
+        (status = 503, description = "The mediator has as many sockets open as it takes (retry after the `Retry-After` seconds), or storage is unavailable")
     )
 )]
 async fn websocket(
@@ -284,46 +507,78 @@ async fn websocket(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let ip = client_ip(
-        &headers,
-        state.client_ip_header.as_ref(),
-        connect.map(|c| c.0.0),
-    );
-    if over_limit(&state, ip).await {
-        return too_many_requests();
+    let ip = client_ip(&headers, &state, connect.map(|c| c.0.0));
+    match over_limit(&state, ip).await {
+        Verdict::Allowed => {}
+        Verdict::Limited => return too_many_requests(),
+        Verdict::Unavailable => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage unavailable, retry later",
+            );
+        }
     }
+    let guard = match state.sockets.open(ip.map(client_key)) {
+        Ok(guard) => guard,
+        Err(SocketRefused::Client) => return too_many_requests(),
+        Err(SocketRefused::Full) => {
+            crate::metrics::METRICS.capacity_refused(crate::metrics::Refusal::WebSockets);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, HeaderValue::from(RATE_WINDOW_SECS))],
+            )
+                .into_response();
+        }
+    };
     let max = state.mediator.limits().max_message_bytes;
     upgrade
         .max_message_size(max)
         .max_frame_size(max)
-        .on_upgrade(move |socket| websocket_session(socket, state, ip))
+        .on_upgrade(move |socket| websocket_session(socket, state, ip, guard))
 }
 
-async fn websocket_session(mut socket: WebSocket, state: AppState, ip: Option<IpAddr>) {
+async fn websocket_session(
+    mut socket: WebSocket,
+    state: AppState,
+    ip: Option<IpAddr>,
+    _guard: SocketGuard,
+) {
     let mediator = Arc::clone(&state.mediator);
+    let mut stopping = state.stopping.clone();
     let (mut session, mut pushes) = mediator.open_session();
+    let mut ping = tokio::time::interval(SOCKET_PING);
+    ping.tick().await;
+    let mut heard = tokio::time::Instant::now();
     loop {
         tokio::select! {
             frame = socket.recv() => {
+                heard = tokio::time::Instant::now();
                 let text = match frame {
-                    Some(Ok(WsMessage::Text(text))) => text.to_string(),
-                    Some(Ok(WsMessage::Binary(bytes))) => match String::from_utf8(bytes.to_vec()) {
-                        Ok(text) => text,
-                        Err(_) => continue,
-                    },
-                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                    Some(Ok(WsMessage::Text(text))) => Some(text.to_string()),
+                    Some(Ok(WsMessage::Binary(bytes))) => String::from_utf8(bytes.to_vec()).ok(),
+                    Some(Ok(WsMessage::Ping(_))) => None,
+                    // The answer to our ping: it only says the peer is there.
+                    Some(Ok(WsMessage::Pong(_))) => continue,
                     Some(Ok(WsMessage::Close(_)) | Err(_)) | None => break,
                 };
-                if over_limit(&state, ip).await {
+                // Every frame the peer sends counts, whether it opens or not.
+                let refused = match over_limit(&state, ip).await {
+                    Verdict::Allowed => None,
                     // 1008: policy violation.
+                    Verdict::Limited => Some((1008, "rate limit")),
+                    // 1013: try again later.
+                    Verdict::Unavailable => Some((1013, "storage unavailable")),
+                };
+                if let Some((code, reason)) = refused {
                     let _ = socket
                         .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
-                            code: 1008,
-                            reason: "rate limit".into(),
+                            code,
+                            reason: reason.into(),
                         })))
                         .await;
                     break;
                 }
+                let Some(text) = text else { continue };
                 match mediator.receive(&text, Some(&mut session)).await {
                     Ok(Outcome::Reply(reply)) => {
                         if socket.send(WsMessage::Text(reply.into())).await.is_err() {
@@ -332,6 +587,27 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, ip: Option<Ip
                     }
                     Ok(Outcome::Accepted) => {}
                     Err(err) => tracing::debug!(error = %err, "websocket message rejected"),
+                }
+            }
+            // A closed channel (no sender) disables this branch.
+            Ok(()) = stopping.changed() => {
+                if *stopping.borrow() {
+                    let _ = socket
+                        .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1001,
+                            reason: "shutting down".into(),
+                        })))
+                        .await;
+                    break;
+                }
+            }
+            _ = ping.tick() => {
+                if heard.elapsed() >= SOCKET_IDLE {
+                    tracing::debug!("websocket idle, closed");
+                    break;
+                }
+                if socket.send(WsMessage::Ping(Bytes::new())).await.is_err() {
+                    break;
                 }
             }
             Some(queued) = pushes.recv() => {
@@ -343,7 +619,7 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, ip: Option<Ip
             }
         }
     }
-    mediator.close_session(&mut session);
+    mediator.close_session(&mut session).await;
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -385,30 +661,91 @@ async fn invitation(State(state): State<AppState>) -> Json<InvitationBody> {
     get,
     path = "/oob",
     tag = "didcomm",
+    params(OobQuery),
     responses((status = 200, description = "HTML page", content_type = "text/html"))
 )]
-async fn invitation_page(State(state): State<AppState>) -> Html<String> {
+async fn invitation_page(
+    State(state): State<AppState>,
+    Query(query): Query<OobQuery>,
+) -> Html<String> {
     let identity = state.mediator.identity();
-    let wallet_url = oob::wallet_url(&oob::invitation(identity));
-    Html(oob::page(&identity.did, &wallet_url))
+    // The invitation it was opened with, if it is ours (a member's carries
+    // its own id); else the mediator's, which a private one does not offer.
+    let given = query
+        ._oob
+        .as_deref()
+        .and_then(|encoded| oob::read(identity, encoded));
+    let wallet_url = match given {
+        Some(invitation) => Some(oob::wallet_url(&invitation)),
+        None if !state.mediator.limits().private => {
+            Some(oob::wallet_url(&oob::invitation(identity)))
+        }
+        None => None,
+    };
+    Html(oob::page(&identity.did, wallet_url.as_deref()))
+}
+
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+struct OobQuery {
+    /// The invitation, base64url JSON.
+    #[allow(non_snake_case, reason = "the parameter's name in Out-of-Band 2.0")]
+    _oob: Option<String>,
 }
 
 /// The client IP: the last address in the configured proxy header (the one
-/// our proxy added), else the TCP peer.
-fn client_ip(
-    headers: &HeaderMap,
-    header: Option<&HeaderName>,
-    peer: Option<SocketAddr>,
-) -> Option<IpAddr> {
-    match header {
-        Some(name) => headers
+/// our proxy added) when the TCP peer is a trusted proxy, else the peer —
+/// also when the header is missing, so leaving it out does not escape the
+/// rate limit, and when the peer is anyone else, so writing it does not
+/// either.
+fn client_ip(headers: &HeaderMap, state: &AppState, peer: Option<SocketAddr>) -> Option<IpAddr> {
+    let peer = peer.map(|p| p.ip());
+    let trusted = |ip: IpAddr| state.trusted_proxies.iter().any(|net| net.contains(ip));
+    match (&state.client_ip_header, peer) {
+        (Some(name), Some(peer)) if trusted(peer) => headers
             .get_all(name)
             .iter()
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(','))
             .filter_map(|v| v.trim().parse().ok())
-            .next_back(),
-        None => peer.map(|p| p.ip()),
+            .next_back()
+            .or(Some(peer)),
+        _ => peer,
+    }
+}
+
+/// The client a request comes from, as the rate limit counts it ([`client_key`]
+/// of [`client_ip`]): what the portal's sign-in requests are capped by.
+#[derive(Debug, Clone, Copy)]
+pub struct Client(pub Option<IpAddr>);
+
+impl axum::extract::FromRequestParts<AppState> for Client {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        Ok(Self(client_ip(&parts.headers, state, peer).map(client_key)))
+    }
+}
+
+/// Who the rate limit and the socket cap count as one client: an IPv4
+/// address, or an IPv6 /64 — what a single host is usually given, so it
+/// cannot step through its own addresses.
+fn client_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let [a, b, c, d, ..] = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
     }
 }
 
@@ -450,6 +787,61 @@ async fn did_document(State(state): State<AppState>) -> Json<serde_json::Value> 
     Json(state.mediator.identity().document.to_json())
 }
 
+/// Where vulnerabilities are reported: privately, through the repository's GitHub.
+const REPOSITORY: &str = "https://github.com/almena-id/mediator";
+/// security.txt must expire, in less than a year; written on each request, it
+/// stays this far ahead while the mediator runs.
+const SECURITY_TXT_TTL: Duration = Duration::from_secs(180 * 24 * 60 * 60);
+
+/// security.txt
+///
+/// Where to report a vulnerability (RFC 9116): the repository's private
+/// security advisories.
+#[utoipa::path(
+    get,
+    path = "/.well-known/security.txt",
+    tag = "operations",
+    responses((status = 200, description = "security.txt", content_type = "text/plain"))
+)]
+async fn security_txt() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        security_txt_body(SystemTime::now() + SECURITY_TXT_TTL),
+    )
+}
+
+fn security_txt_body(expires: SystemTime) -> String {
+    format!(
+        "Contact: {REPOSITORY}/security/advisories/new\n\
+         Expires: {}\n\
+         Policy: {REPOSITORY}/security/policy\n\
+         Preferred-Languages: en, es\n",
+        rfc3339(expires)
+    )
+}
+
+/// `time` as an RFC 3339 UTC timestamp to the second, e.g. `2026-10-02T09:30:00Z`.
+fn rfc3339(time: SystemTime) -> String {
+    let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's `civil_from_days`).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Health {
     /// `ok`, or `degraded` when a dependency is down.
@@ -465,14 +857,15 @@ pub struct Health {
     /// `ok` or `unavailable`.
     #[schema(example = "ok")]
     pub storage: &'static str,
-    /// `redis`, or `memory` in development.
-    #[schema(example = "redis")]
-    pub storage_kind: &'static str,
+    /// `ok`, or `full` when new mediations are denied (too many held); the
+    /// mediations held keep working.
+    #[schema(example = "ok")]
+    pub capacity: &'static str,
 }
 
 /// Health check
 ///
-/// Answers `200` while the service and its storage (Redis) are up, `503`
+/// Answers `200` while the service and its storage (SQLite) are up, `503`
 /// when storage is unreachable. The container healthcheck calls it.
 #[utoipa::path(
     get,
@@ -491,7 +884,11 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
         version: crate::VERSION,
         did: state.mediator.identity().did.clone(),
         storage: if healthy { "ok" } else { "unavailable" },
-        storage_kind: state.store.kind(),
+        capacity: if state.mediator.at_capacity() {
+            "full"
+        } else {
+            "ok"
+        },
     };
     let status = if healthy {
         StatusCode::OK
@@ -513,19 +910,29 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::store::MemoryStore;
+    use crate::Config;
+    use crate::store::SqliteStore;
     use crate::testing::{LIMITS, Wallet, mediator_on};
 
     const MAX: usize = LIMITS.max_message_bytes;
 
     fn state() -> AppState {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::memory().unwrap());
         AppState {
             mediator: Arc::new(mediator_on(Arc::clone(&store))),
             store,
             rate_limit: 0,
+            rate_limit_on_error: OnError::Closed,
             client_ip_header: None,
+            trusted_proxies: Arc::from(Config::default().trusted_proxies),
             public_url: "https://mediator.example.com".into(),
+            sockets: Arc::new(Sockets::new(100)),
+            stopping: tokio::sync::watch::channel(false).1,
+            admin: Arc::new(crate::admin::AdminStore::memory().unwrap()),
+            signins: Arc::default(),
+            url_pinned: false,
+            allow_insecure: false,
+            restart: Arc::default(),
         }
     }
 
@@ -559,6 +966,652 @@ mod tests {
             .unwrap()
     }
 
+    /// One request through the router: status, the cookies it sets, body.
+    async fn call(state: &AppState, request: Request<Body>) -> (StatusCode, Vec<String>, String) {
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, cookies, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn with_cookie(method: &str, path: &str, cookie: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// The `name=value` a `Set-Cookie` sets.
+    fn cookie_pair<'a>(cookies: &'a [String], name: &str) -> &'a str {
+        cookies
+            .iter()
+            .find(|c| c.starts_with(&format!("{name}=")))
+            .and_then(|c| c.split(';').next())
+            .unwrap()
+    }
+
+    /// The wallet's part: reads the request the browser's cookie names and
+    /// answers it, signed by `key`. Returns the DID it signed as.
+    async fn wallet_answers(
+        state: &AppState,
+        signin_cookie: &str,
+        key: &almena_didcomm::SecretKey,
+    ) -> String {
+        let id = signin_cookie
+            .trim_start_matches("almena_signin=")
+            .split('.')
+            .next()
+            .unwrap();
+        let (status, _, body) = call(
+            state,
+            Request::get(format!("/portal/requests/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(request["client_id"], "https://mediator.example.com");
+        assert_eq!(request["purpose"], "sign_in");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (token, did) = crate::signin::wallet_token(
+            key,
+            "https://mediator.example.com",
+            request["nonce"].as_str().unwrap(),
+            now,
+        );
+        let (status, _, _) = call(
+            state,
+            Request::post(format!("/portal/requests/{id}/response"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("id_token={token}")))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        did
+    }
+
+    #[tokio::test]
+    async fn the_first_wallet_with_the_code_becomes_administrator_and_signs_in() {
+        use almena_didcomm::SecretKey;
+        let state = state();
+        let code = state.admin.new_setup_code().unwrap();
+        let owner = SecretKey::generate(Curve::Ed25519).unwrap();
+
+        // Without the right code, no wallet request.
+        let (_, cookies, body) = call(
+            &state,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("code=wrong"))
+                .unwrap(),
+        )
+        .await;
+        assert!(body.contains("That is not the setup code."));
+        assert!(cookies.is_empty());
+
+        // With it: a QR code, and this browser's cookie to collect the answer.
+        let (status, cookies, body) = call(
+            &state,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("code={code}")))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(
+            "almena://auth?request_uri=https%3A%2F%2Fmediator.example.com%2Fportal%2Frequests%2F"
+        ));
+        let first = cookie_pair(&cookies, "almena_signin").to_owned();
+        assert!(
+            cookies[0].contains("HttpOnly")
+                && cookies[0].contains("SameSite=Strict")
+                && cookies[0].contains("Secure")
+        );
+        let poll = |cookie: String| with_cookie("POST", "/portal/sign-in/status", &cookie);
+        let (_, _, body) = call(&state, poll(first.clone())).await;
+        assert!(body.contains("\"waiting\""));
+
+        // The code on screen is swapped for a new one, with a new cookie.
+        let (_, cookies, body) =
+            call(&state, with_cookie("POST", "/portal/sign-in/renew", &first)).await;
+        assert!(body.contains("\"renewed\"") && body.contains("<svg"));
+        let signin = cookie_pair(&cookies, "almena_signin").to_owned();
+        assert_ne!(signin, first);
+        let (_, _, body) = call(&state, poll(first.clone())).await;
+        assert!(body.contains("\"gone\""));
+        let (_, _, body) = call(&state, poll(signin.clone())).await;
+        assert!(body.contains("\"waiting\""));
+
+        let did = wallet_answers(&state, &signin, &owner).await;
+        // Another browser without the cookie collects nothing.
+        let (_, _, body) = call(&state, poll("almena_signin=x.y".into())).await;
+        assert!(body.contains("\"gone\""));
+        let (_, cookies, body) = call(&state, poll(signin)).await;
+        assert!(body.contains("\"signed_in\""));
+        assert!(state.admin.is_admin(&did).unwrap());
+        // The setup code went with it.
+        assert!(!state.admin.is_setup_code(&code).unwrap());
+        let session = cookie_pair(&cookies, "almena_admin").to_owned();
+
+        // The dashboard knows them; the setup page says it is done.
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains("<h1>Overview</h1>") && body.contains(&did));
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/admins", &session)).await;
+        assert!(body.contains(&did) && body.contains("(you)"));
+        let (_, _, body) = call(
+            &state,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("code={code}")))
+                .unwrap(),
+        )
+        .await;
+        assert!(body.contains("Set up already"));
+
+        // A wallet that is not an administrator signs in to nothing.
+        let stranger = SecretKey::generate(Curve::Ed25519).unwrap();
+        let (_, cookies, body) =
+            call(&state, Request::get("/portal").body(Body::empty()).unwrap()).await;
+        assert!(body.contains("Sign in"));
+        let signin = cookie_pair(&cookies, "almena_signin").to_owned();
+        wallet_answers(&state, &signin, &stranger).await;
+        let (_, cookies, body) = call(&state, poll(signin)).await;
+        assert!(body.contains("\"not_an_admin\""));
+        assert!(
+            !cookies
+                .iter()
+                .any(|c| c.starts_with("almena_admin=") && !c.contains("Max-Age=0"))
+        );
+
+        // The administrator signs in again with the same wallet.
+        let (_, cookies, _) =
+            call(&state, Request::get("/portal").body(Body::empty()).unwrap()).await;
+        let signin = cookie_pair(&cookies, "almena_signin").to_owned();
+        assert_eq!(wallet_answers(&state, &signin, &owner).await, did);
+        let (_, _, body) = call(&state, poll(signin)).await;
+        assert!(body.contains("\"signed_in\""));
+
+        // Signing out from another site is refused; from here it ends the session.
+        let foreign = Request::post("/portal/sign-out")
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(&state, foreign).await.0, StatusCode::FORBIDDEN);
+        let (status, _, _) = call(&state, with_cookie("POST", "/portal/sign-out", &session)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains("Sign in"));
+    }
+
+    /// A private mediator, its administration shared with its dispatcher.
+    fn private_state() -> AppState {
+        let mut state = state();
+        let mediator = crate::dispatch::Mediator::new(
+            crate::identity::Identity::ephemeral("https://mediator.example.com").unwrap(),
+            Arc::clone(&state.store),
+            crate::dispatch::Limits {
+                private: true,
+                ..LIMITS
+            },
+            None,
+        )
+        .with_admin(Arc::clone(&state.admin));
+        state.mediator = Arc::new(mediator);
+        state
+            .admin
+            .set_site(&crate::admin::Site {
+                public_url: "https://mediator.example.com".into(),
+                access: crate::config::Access::Private,
+            })
+            .unwrap();
+        state
+    }
+
+    fn form(path: &str, cookie: &str, body: &str) -> Request<Body> {
+        Request::post(path)
+            .header(header::COOKIE, cookie)
+            .header(header::ORIGIN, "https://mediator.example.com")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn administrators_invite_members_and_other_administrators() {
+        use almena_didcomm::SecretKey;
+        let state = private_state();
+        state.admin.add_admin("did:key:z6Mk-first", 1).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session = format!(
+            "almena_admin={}",
+            state.admin.new_session("did:key:z6Mk-first", now).unwrap()
+        );
+
+        // A private mediator's pages offer no invitation to strangers.
+        let (_, _, body) = call(&state, Request::get("/").body(Body::empty()).unwrap()).await;
+        assert!(body.contains("private mediator") && !body.contains("invitation QR code"));
+        let (_, _, body) = call(&state, Request::get("/oob").body(Body::empty()).unwrap()).await;
+        assert!(
+            body.contains("Ask one of them for an invitation") && !body.contains("almena://oob")
+        );
+
+        // Without a session, or from another site, nothing is made.
+        let (status, _, _) = call(
+            &state,
+            form("/portal/invitations", "", "label=Ana&uses=1&days=7"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let foreign = Request::post("/portal/invitations")
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("label=Ana&uses=1&days=7"))
+            .unwrap();
+        assert_eq!(call(&state, foreign).await.0, StatusCode::FORBIDDEN);
+        let (status, _, _) = call(
+            &state,
+            form("/portal/invitations", &session, "label=Ana&uses=0&days=7"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            state
+                .admin
+                .invitations(crate::admin::InvitationKind::Member, now)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A member invitation, shown as the mediator's own with its id.
+        let response = router(state.clone())
+            .oneshot(form(
+                "/portal/invitations",
+                &session,
+                "label=Ana&uses=1&days=7",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let id = location
+            .trim_start_matches("/portal/invitations/")
+            .to_owned();
+        let (status, _, body) = call(&state, with_cookie("GET", &location, &session)).await;
+        assert_eq!(status, StatusCode::OK);
+        let start = body.find("https://mediator.example.com/oob?_oob=").unwrap();
+        let url = &body[start..start + body[start..].find('"').unwrap()];
+        // Opened in a browser without the wallet, it leads into the wallet with itself.
+        let path = url.trim_start_matches("https://mediator.example.com");
+        let (_, _, page) = call(&state, Request::get(path).body(Body::empty()).unwrap()).await;
+        let encoded = url.split_once("?_oob=").unwrap().1;
+        assert!(page.contains(&format!("almena://oob?_oob={encoded}")));
+        let invitation = oob::read(state.mediator.identity(), encoded).unwrap();
+        assert_eq!(invitation.id, id);
+
+        // Ana's wallet answers it: a mailbox, and a member.
+        let ana = Wallet::new(Curve::X25519);
+        let granted = ana
+            .request_in(
+                &state.mediator,
+                crate::dispatch::protocols::MEDIATE_REQUEST,
+                json!({}),
+                Some(&id),
+            )
+            .await;
+        assert_eq!(granted.type_, crate::dispatch::protocols::MEDIATE_GRANT);
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/members", &session)).await;
+        assert!(body.contains("<strong>Ana</strong>"));
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/mailboxes", &session)).await;
+        assert!(body.contains("<th>Member</th>") && body.contains("<td>Ana</td>"));
+        // Spent: no longer listed.
+        assert!(!body.contains(&format!("/portal/invitations/{id}")));
+
+        // Removing her deletes her mailbox.
+        let (status, _, _) = call(
+            &state,
+            form(
+                "/portal/members/remove",
+                &session,
+                &format!("mediation={}", ana.did.replace(':', "%3A")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(!state.store.has_mediation(&ana.did).await.unwrap());
+        assert!(state.admin.members().unwrap().is_empty());
+
+        // An invitation to be an administrator, taken by signing in at its link.
+        let response = router(state.clone())
+            .oneshot(form("/portal/admins/invite", &session, "label=Bea"))
+            .await
+            .unwrap();
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let id = location
+            .trim_start_matches("/portal/invitations/")
+            .to_owned();
+        let (_, _, body) = call(&state, with_cookie("GET", &location, &session)).await;
+        assert!(body.contains(&format!("https://mediator.example.com/portal/join/{id}")));
+        let (status, cookies, _) = call(
+            &state,
+            Request::get(format!("/portal/join/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let signin = cookie_pair(&cookies, "almena_signin").to_owned();
+        let bea = SecretKey::generate(Curve::Ed25519).unwrap();
+        let did = wallet_answers(&state, &signin, &bea).await;
+        let (_, cookies, body) = call(
+            &state,
+            with_cookie("POST", "/portal/sign-in/status", &signin),
+        )
+        .await;
+        assert!(body.contains("\"signed_in\""));
+        assert!(cookies.iter().any(|c| c.starts_with("almena_admin=")));
+        assert!(state.admin.is_admin(&did).unwrap());
+        // One use: the link is spent.
+        let (status, _, _) = call(
+            &state,
+            Request::get(format!("/portal/join/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Administrators are equal: Bea's removal by the first ends her sessions.
+        let (status, _, _) = call(
+            &state,
+            form(
+                "/portal/admins/remove",
+                &session,
+                &format!("did={}", did.replace(':', "%3A")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(!state.admin.is_admin(&did).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_public_mediator_makes_no_member_invitations() {
+        let state = state();
+        state.admin.add_admin("did:key:z6Mk-first", 1).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session = format!(
+            "almena_admin={}",
+            state.admin.new_session("did:key:z6Mk-first", now).unwrap()
+        );
+        let (status, _, _) = call(
+            &state,
+            form("/portal/invitations", &session, "label=Ana&uses=1&days=7"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, _, body) = call(&state, Request::get("/oob").body(Body::empty()).unwrap()).await;
+        assert!(body.contains("almena://oob?_oob="));
+    }
+
+    /// A session for a new administrator `did`.
+    fn session_for(state: &AppState, did: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        state.admin.add_admin(did, now).unwrap();
+        format!(
+            "almena_admin={}",
+            state.admin.new_session(did, now).unwrap()
+        )
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_lists_and_removes_mailboxes() {
+        let state = state();
+        let session = session_for(&state, "did:key:z6Mk-first");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Without a session, every section leads to signing in.
+        for path in [
+            "/portal/mailboxes",
+            "/portal/members",
+            "/portal/admins",
+            "/portal/site",
+        ] {
+            let (status, _, _) =
+                call(&state, Request::get(path).body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
+        }
+        // A public mediator has no members' section.
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains(r#"href="/portal/mailboxes""#));
+        assert!(!body.contains(r#"href="/portal/members""#));
+        let (status, _, _) = call(&state, with_cookie("GET", "/portal/members", &session)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+
+        // A wallet's mailbox, with a message waiting.
+        let wallet = Wallet::new(Curve::X25519);
+        let granted = wallet
+            .request_in(
+                &state.mediator,
+                crate::dispatch::protocols::MEDIATE_REQUEST,
+                json!({}),
+                None,
+            )
+            .await;
+        assert_eq!(granted.type_, crate::dispatch::protocols::MEDIATE_GRANT);
+        let recipient = "did:peer:2.recipient-x";
+        state
+            .store
+            .add_recipient(&wallet.did, recipient, 10)
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(&wallet.did, recipient, "hello", now, LIMITS.queue)
+            .await
+            .unwrap();
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains(r#"<span class="label">Mailboxes</span><strong>1</strong>"#));
+        assert!(body.contains(r#"<span class="label">Messages waiting</span><strong>1</strong>"#));
+        assert!(body.contains("at most 1 in one mailbox, of 3"));
+        let (_, _, body) = call(
+            &state,
+            with_cookie("GET", "/portal/mailboxes?q=recipient-x", &session),
+        )
+        .await;
+        assert!(body.contains(&format!(r#"title="{}""#, wallet.did)));
+        assert!(body.contains("1 mailbox match"));
+        // Its DIDs against the ceiling (3 in the test mediator).
+        assert!(body.contains(r#"<td class="num">1<span> / 3</span></td>"#));
+        let (_, _, body) = call(
+            &state,
+            with_cookie("GET", "/portal/mailboxes?q=nothing-like-it", &session),
+        )
+        .await;
+        assert!(body.contains("No mailbox matches."));
+
+        // Removed only from this mediator's pages.
+        let mediation = format!("mediation={}", wallet.did.replace(':', "%3A"));
+        let foreign = Request::post("/portal/mailboxes/remove")
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(mediation.clone()))
+            .unwrap();
+        assert_eq!(call(&state, foreign).await.0, StatusCode::FORBIDDEN);
+        assert!(state.store.has_mediation(&wallet.did).await.unwrap());
+        let (status, _, _) = call(
+            &state,
+            form("/portal/mailboxes/remove", &session, &mediation),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(!state.store.has_mediation(&wallet.did).await.unwrap());
+        assert_eq!(state.store.mediation_of(recipient).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_site_moves_only_to_a_proven_domain() {
+        let state = state();
+        state
+            .admin
+            .set_site(&crate::admin::Site {
+                public_url: "https://mediator.example.com".into(),
+                access: crate::config::Access::Public,
+            })
+            .unwrap();
+        let session = session_for(&state, "did:key:z6Mk-first");
+        let (status, _, _) = call(
+            &state,
+            Request::get("/.well-known/almena-setup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/site", &session)).await;
+        assert!(body.contains("New public URL") && body.contains("has to connect again"));
+
+        // Only a bare https domain, and not the one it has.
+        for (url, why) in [
+            ("http%3A%2F%2Fother.example.com", "https://"),
+            ("other.example.com%2Fpath", "nothing after the domain"),
+            ("mediator.example.com", "already"),
+        ] {
+            let (status, _, body) = call(
+                &state,
+                form("/portal/site/url", &session, &format!("url={url}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}");
+            assert!(body.contains(why), "{url}");
+        }
+        assert_eq!(state.admin.pending().unwrap(), None);
+
+        // A new domain: its value is published for the HTTPS check.
+        let (status, _, _) = call(
+            &state,
+            form("/portal/site/url", &session, "url=almena-test.invalid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let pending = state.admin.pending().unwrap().unwrap();
+        assert_eq!(pending.public_url, "https://almena-test.invalid");
+        assert_eq!(pending.access, crate::config::Access::Public);
+        let (status, _, served) = call(
+            &state,
+            Request::get("/.well-known/almena-setup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((status, served), (StatusCode::OK, pending.token.clone()));
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal/site", &session)).await;
+        assert!(body.contains("_almena-mediator.almena-test.invalid"));
+        assert!(body.contains(&pending.token));
+        let (_, _, body) = call(&state, with_cookie("GET", "/portal", &session)).await;
+        assert!(body.contains("Moving to <code>https://almena-test.invalid</code>"));
+
+        // Unproven, it stays where it is, and so do its administrators.
+        let (status, _, body) = call(&state, form("/portal/site/check", &session, "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"class="fail">DNS"#) && body.contains(r#"class="fail">HTTPS"#));
+        assert_eq!(
+            state.admin.site().unwrap().unwrap().public_url,
+            "https://mediator.example.com"
+        );
+        assert!(state.admin.is_admin("did:key:z6Mk-first").unwrap());
+
+        // Cancelled, nothing is published any more.
+        let (status, _, _) = call(&state, form("/portal/site/cancel", &session, "")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(state.admin.pending().unwrap(), None);
+
+        // A URL set by ALMENA_PUBLIC_URL is moved there.
+        let pinned = AppState {
+            url_pinned: true,
+            ..state.clone()
+        };
+        let (_, _, body) = call(&pinned, with_cookie("GET", "/portal/site", &session)).await;
+        assert!(body.contains("ALMENA_PUBLIC_URL") && !body.contains("New public URL"));
+        let (status, _, _) = call(
+            &pinned,
+            form("/portal/site/url", &session, "url=other.example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.admin.pending().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn wallet_answers_that_do_not_hold_are_refused() {
+        let state = state();
+        let (status, _, body) = call(
+            &state,
+            Request::get("/portal/requests/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("request_not_found"));
+        state.admin.add_admin("did:key:z6Mk-someone", 1).unwrap();
+        let (_, cookies, _) =
+            call(&state, Request::get("/portal").body(Body::empty()).unwrap()).await;
+        let id = cookie_pair(&cookies, "almena_signin")
+            .trim_start_matches("almena_signin=")
+            .split('.')
+            .next()
+            .unwrap()
+            .to_owned();
+        let answer = |body: &str| {
+            Request::post(format!("/portal/requests/{id}/response"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let (status, _, body) = call(&state, answer("id_token=a.b.c")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid_token"));
+        assert_eq!(
+            call(&state, answer("nothing=here")).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     #[tokio::test]
     async fn health_reports_ok_and_the_did() {
         let (status, body) = get(state(), "/health").await;
@@ -584,6 +1637,30 @@ mod tests {
         assert_eq!(
             json["service"][0]["serviceEndpoint"][0]["uri"],
             "https://mediator.example.com/didcomm"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_txt_is_served_at_the_well_known_path() {
+        let (status, body) = get(state(), "/.well-known/security.txt").await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            text.contains(
+                "Contact: https://github.com/almena-id/mediator/security/advisories/new\n"
+            )
+        );
+        assert!(text.contains("Expires: "));
+    }
+
+    #[test]
+    fn security_txt_expires_on_the_given_instant() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_806_143_400);
+        assert!(security_txt_body(expires).contains("Expires: 2027-03-27T10:30:00Z\n"));
+        assert_eq!(rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            rfc3339(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00Z"
         );
     }
 
@@ -658,7 +1735,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["info"]["title"], "Almena mediator");
-        for path in ["/health", "/didcomm", "/.well-known/did.json"] {
+        for path in [
+            "/health",
+            "/didcomm",
+            "/.well-known/did.json",
+            "/.well-known/security.txt",
+        ] {
             assert!(json["paths"][path].is_object(), "{path} missing");
         }
     }
@@ -667,7 +1749,9 @@ mod tests {
     async fn docs_page_is_served() {
         let (status, body) = get(state(), DOCS_PATH).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(String::from_utf8(body).unwrap().contains("/didcomm"));
+        let page = String::from_utf8(body).unwrap();
+        assert!(page.contains("/didcomm"));
+        assert!(page.contains(r#"<link rel="icon" type="image/png" href="/icon.png"/>"#));
     }
 
     #[tokio::test]
@@ -679,13 +1763,11 @@ mod tests {
             let state = state.clone();
             async move {
                 router(state)
-                    .oneshot(
+                    .oneshot(from_proxy(
                         Request::post("/didcomm")
                             .header(header::CONTENT_TYPE, "application/json")
-                            .header("x-forwarded-for", format!("198.51.100.1, {ip}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
+                            .header("x-forwarded-for", format!("198.51.100.1, {ip}")),
+                    ))
                     .await
                     .unwrap()
                     .status()
@@ -707,6 +1789,16 @@ mod tests {
         );
     }
 
+    /// A request as a proxy in front, on the container network, hands it
+    /// over.
+    fn from_proxy(request: axum::http::request::Builder) -> Request<Body> {
+        let peer: SocketAddr = "172.18.0.3:40000".parse().unwrap();
+        request
+            .extension(ConnectInfo(peer))
+            .body(Body::empty())
+            .unwrap()
+    }
+
     #[test]
     fn client_ip_prefers_the_proxy_header() {
         let mut headers = HeaderMap::new();
@@ -714,17 +1806,143 @@ mod tests {
             "x-forwarded-for",
             HeaderValue::from_static("10.0.0.1, 192.0.2.7"),
         );
-        let name = HeaderName::from_static("x-forwarded-for");
+        let state = AppState {
+            client_ip_header: Some(HeaderName::from_static("x-forwarded-for")),
+            ..state()
+        };
         let peer = Some("127.0.0.1:5000".parse().unwrap());
         assert_eq!(
-            client_ip(&headers, Some(&name), peer),
+            client_ip(&headers, &state, peer),
             Some("192.0.2.7".parse().unwrap())
         );
+        let unset = AppState {
+            client_ip_header: None,
+            ..state.clone()
+        };
         assert_eq!(
-            client_ip(&headers, None, peer),
+            client_ip(&headers, &unset, peer),
             Some("127.0.0.1".parse().unwrap())
         );
-        assert_eq!(client_ip(&HeaderMap::new(), Some(&name), peer), None);
+        // A request without the header (one that did not come through the
+        // proxy) is counted by its peer, not let through.
+        assert_eq!(
+            client_ip(&HeaderMap::new(), &state, peer),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        // A peer that is not a trusted proxy wrote the header itself.
+        let stranger = Some("203.0.113.50:5000".parse().unwrap());
+        assert_eq!(
+            client_ip(&headers, &state, stranger),
+            Some("203.0.113.50".parse().unwrap())
+        );
+        let nobody = AppState {
+            trusted_proxies: Arc::from(Vec::new()),
+            ..state.clone()
+        };
+        assert_eq!(
+            client_ip(&headers, &nobody, peer),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        // Nor is a header believed when the peer is unknown.
+        assert_eq!(client_ip(&headers, &state, None), None);
+    }
+
+    #[tokio::test]
+    async fn a_spoofed_header_from_outside_does_not_escape_the_rate_limit() {
+        let mut state = state();
+        state.rate_limit = 1;
+        state.client_ip_header = Some(HeaderName::from_static("x-forwarded-for"));
+        let send = |forwarded: String| {
+            let state = state.clone();
+            async move {
+                let peer: SocketAddr = "203.0.113.50:40000".parse().unwrap();
+                router(state)
+                    .oneshot(
+                        Request::post("/didcomm")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header("x-forwarded-for", forwarded)
+                            .extension(ConnectInfo(peer))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(
+            send("192.0.2.1".into()).await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            send("192.0.2.2".into()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_count_refuses_unless_open() {
+        let store = Arc::new(SqliteStore::memory().unwrap());
+        store
+            .failing_hits
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let state = AppState {
+            store: store.clone() as Arc<dyn Store>,
+            rate_limit: 10,
+            ..state()
+        };
+        let send = |state: AppState| async move {
+            router(state)
+                .oneshot(from_proxy(
+                    Request::post("/didcomm").header(header::CONTENT_TYPE, "application/json"),
+                ))
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(send(state.clone()).await, StatusCode::SERVICE_UNAVAILABLE);
+        let open = AppState {
+            rate_limit_on_error: OnError::Open,
+            ..state
+        };
+        assert_eq!(send(open).await, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn an_ipv6_client_is_its_64() {
+        let key = |ip: &str| client_key(ip.parse().unwrap());
+        assert_eq!(key("2001:db8:1:2:3:4:5:6"), key("2001:db8:1:2:ffff::1"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:192.0.2.7"), key("192.0.2.7"));
+    }
+
+    #[test]
+    fn sockets_are_capped_per_client() {
+        let sockets = Arc::new(Sockets::new(100));
+        let client = Some("192.0.2.7".parse().unwrap());
+        let open: Vec<_> = (0..MAX_SOCKETS_PER_CLIENT)
+            .map(|_| sockets.open(client).unwrap())
+            .collect();
+        assert_eq!(sockets.open(client).err(), Some(SocketRefused::Client));
+        assert!(sockets.open(Some("192.0.2.8".parse().unwrap())).is_ok());
+        drop(open);
+        assert!(sockets.open(client).is_ok());
+        assert!(sockets.is_empty());
+    }
+
+    #[test]
+    fn sockets_are_capped_in_all() {
+        let sockets = Arc::new(Sockets::new(2));
+        let a = sockets.open(Some("192.0.2.7".parse().unwrap())).unwrap();
+        let b = sockets.open(None).unwrap();
+        assert_eq!(
+            sockets.open(Some("192.0.2.8".parse().unwrap())).err(),
+            Some(SocketRefused::Full)
+        );
+        drop(a);
+        assert!(sockets.open(Some("192.0.2.8".parse().unwrap())).is_ok());
+        drop(b);
+        assert!(sockets.is_empty());
     }
 
     #[tokio::test]
@@ -772,7 +1990,16 @@ mod tests {
 
     #[tokio::test]
     async fn home_page_shows_the_name_and_its_icon_is_served() {
-        let (status, body) = get(state(), "/").await;
+        // Until the onboarding is over, home leads to it.
+        let fresh = state();
+        let response = router(fresh.clone())
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/setup");
+        fresh.admin.add_admin("did:key:z6Mk-first", 1).unwrap();
+        let (status, body) = get(fresh, "/").await;
         assert_eq!(status, StatusCode::OK);
         let html = String::from_utf8(body).unwrap();
         assert!(html.contains("Almena Mediator"));
@@ -782,6 +2009,11 @@ mod tests {
         let (status, body) = get(state(), home::ICON_PATH).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.starts_with(b"\x89PNG"));
+        let (status, body) = get(state(), "/fonts/inter.woff2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with(b"wOF2"));
+        let (status, _) = get(state(), "/fonts/missing.woff2").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -793,6 +2025,44 @@ mod tests {
                 .unwrap()
                 .contains("did:web:mediator.example.com")
         );
+    }
+
+    /// Shutting down closes the open sockets (1001) instead of waiting for
+    /// them, and counts them out of the per-client cap.
+    #[tokio::test]
+    async fn websockets_close_when_the_mediator_stops() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as Frame;
+
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let state = AppState {
+            stopping,
+            ..state()
+        };
+        let sockets = Arc::clone(&state.sockets);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        stop.send(true).unwrap();
+        let closed = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .unwrap()
+            {
+                Some(Ok(Frame::Close(frame))) => break frame,
+                Some(Ok(_)) => continue,
+                other => panic!("no close frame: {other:?}"),
+            }
+        };
+        assert_eq!(u16::from(closed.unwrap().code), 1001);
+        drop(ws);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(sockets.is_empty());
     }
 
     /// A real server, a real WebSocket client: live mode pushes a message the

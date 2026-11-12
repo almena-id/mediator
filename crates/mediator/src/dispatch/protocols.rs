@@ -15,6 +15,7 @@ pub const PROBLEM_REPORT: &str = "https://didcomm.org/report-problem/2.0/problem
 pub const COORDINATE_MEDIATION: &str = "https://didcomm.org/coordinate-mediation/3.0/";
 pub const MEDIATE_REQUEST: &str = "https://didcomm.org/coordinate-mediation/3.0/mediate-request";
 pub const MEDIATE_GRANT: &str = "https://didcomm.org/coordinate-mediation/3.0/mediate-grant";
+pub const MEDIATE_DENY: &str = "https://didcomm.org/coordinate-mediation/3.0/mediate-deny";
 pub const RECIPIENT_UPDATE: &str = "https://didcomm.org/coordinate-mediation/3.0/recipient-update";
 pub const RECIPIENT_UPDATE_RESPONSE: &str =
     "https://didcomm.org/coordinate-mediation/3.0/recipient-update-response";
@@ -114,6 +115,7 @@ pub fn discover_features(
         .body
         .get("queries")
         .and_then(Value::as_array)
+        .filter(|queries| queries.len() <= MAX_QUERIES)
         .ok_or(Problem::InvalidBody)?;
 
     let mut disclosures = Vec::new();
@@ -157,19 +159,40 @@ pub fn discover_features(
     Ok(Message::new(DISCLOSE, json!({ "disclosures": disclosures })).reply_to(request))
 }
 
+/// Queries one `queries` message may ask; more is a bad request.
+const MAX_QUERIES: usize = 32;
+/// Longest `match` pattern looked at; a longer one matches nothing.
+const MAX_PATTERN: usize = 256;
+
 /// `*` matches any run of characters; everything else matches literally.
+/// Linear in the pattern times the value, however many `*` it holds: a
+/// stranger's query must not cost more than reading it.
 fn matches(pattern: &str, value: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == value,
-        Some((prefix, rest)) => {
-            let Some(tail) = value.strip_prefix(prefix) else {
-                return false;
-            };
-            (0..=tail.len())
-                .filter(|&i| tail.is_char_boundary(i))
-                .any(|i| matches(rest, &tail[i..]))
+    if pattern.len() > MAX_PATTERN {
+        return false;
+    }
+    let (pattern, value): (Vec<char>, Vec<char>) =
+        (pattern.chars().collect(), value.chars().collect());
+    let (mut p, mut v) = (0, 0);
+    // The last `*` seen, and where in the value it started matching.
+    let mut star: Option<(usize, usize)> = None;
+    while v < value.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, v));
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == value[v] {
+            p += 1;
+            v += 1;
+        } else if let Some((at, from)) = star {
+            // Let that `*` take one more character and try again after it.
+            p = at + 1;
+            v = from + 1;
+            star = Some((at, from + 1));
+        } else {
+            return false;
         }
     }
+    pattern[p..].iter().all(|&c| c == '*')
 }
 
 /// Problems the mediator reports back to the sender.
@@ -181,7 +204,7 @@ pub enum Problem {
     InvalidBody,
     /// `expires_time` has passed.
     Expired,
-    /// Mediation and pickup need an authcrypted sender.
+    /// Mediation, pickup and push messages need an authcrypted sender.
     Unauthenticated,
     /// The sender has no mediation with this mediator.
     NoMediation,
@@ -254,6 +277,37 @@ mod tests {
         ));
         assert!(matches("return_route", "return_route"));
         assert!(!matches("return", "return_route"));
+        assert!(matches(
+            "**trust**ping**",
+            "https://didcomm.org/trust-ping/2.0"
+        ));
+        assert!(matches("a*b*c", "aXbYc"));
+        assert!(!matches("a*b*c", "aXbYd"));
+        assert!(matches("", ""));
+        assert!(!matches("", "x"));
+    }
+
+    #[test]
+    fn many_stars_cost_no_more_than_reading_them() {
+        // Backtracking took about C(84, 40) steps for this one.
+        let pattern = format!("{}Z", "*".repeat(40));
+        let started = std::time::Instant::now();
+        assert!(!matches(
+            &pattern,
+            "https://didcomm.org/coordinate-mediation/3.0"
+        ));
+        assert!(!matches(&"*".repeat(MAX_PATTERN + 1), "anything"));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn too_many_queries_are_a_bad_request() {
+        let query = json!({"feature-type": "protocol", "match": "*"});
+        let request = Message::new(QUERIES, json!({"queries": vec![query; MAX_QUERIES + 1]}));
+        assert_eq!(
+            discover_features(&request, 1, &[]).unwrap_err(),
+            Problem::InvalidBody
+        );
     }
 
     #[test]

@@ -6,22 +6,34 @@ services:
       context: .
     image: almena-mediator:dev
     restart: unless-stopped
+    # The mediator gives requests in flight 20 s to finish, then stops.
+    stop_grace_period: 30s
     ports:
-      - "${ALMENA_MEDIATOR_PORT:-8080}:8080"
+      # Plain HTTP on the host, loopback by default: TLS and the public name
+      # are the business of whatever proxy the operator puts in front.
+      # Published on every interface, anyone could reach it past that proxy
+      # and write their own client IP header.
+      - "${ALMENA_MEDIATOR_BIND:-127.0.0.1}:${ALMENA_MEDIATOR_PORT:-8080}:8080"
     environment:
-      ALMENA_PUBLIC_URL: ${ALMENA_PUBLIC_URL:-https://mediator.dev.almena.network}
-      ALMENA_REDIS_URL: redis://redis:6379
-      ALMENA_REDIS_PASSWORD: ${ALMENA_REDIS_PASSWORD:-}
+      # The public URL and whether it is public or private are not set here:
+      # the onboarding at /setup asks for them (the setup code is in the log).
       ALMENA_MAX_MESSAGE_BYTES: ${ALMENA_MAX_MESSAGE_BYTES:-1048576}
       ALMENA_QUEUE_TTL: ${ALMENA_QUEUE_TTL:-2592000}
-      ALMENA_QUEUE_MAX_MESSAGES: ${ALMENA_QUEUE_MAX_MESSAGES:-10000}
-      ALMENA_QUEUE_MAX_BYTES: ${ALMENA_QUEUE_MAX_BYTES:-104857600}
-      ALMENA_MAX_RECIPIENT_DIDS: ${ALMENA_MAX_RECIPIENT_DIDS:-100}
+      ALMENA_QUEUE_MAX_MESSAGES: ${ALMENA_QUEUE_MAX_MESSAGES:-1000}
+      ALMENA_QUEUE_MAX_BYTES: ${ALMENA_QUEUE_MAX_BYTES:-10485760}
+      ALMENA_MAX_RECIPIENT_DIDS: ${ALMENA_MAX_RECIPIENT_DIDS:-1000}
+      ALMENA_MAX_MEDIATIONS: ${ALMENA_MAX_MEDIATIONS:-10000}
+      ALMENA_MAX_SOCKETS: ${ALMENA_MAX_SOCKETS:-5000}
       ALMENA_RECIPIENT_PROOF: ${ALMENA_RECIPIENT_PROOF:-required}
       ALMENA_MEDIATION_TTL: ${ALMENA_MEDIATION_TTL:-7776000}
       ALMENA_RATE_LIMIT: ${ALMENA_RATE_LIMIT:-60}
-      # Caddy sets X-Forwarded-For to the client address.
-      ALMENA_CLIENT_IP_HEADER: ${ALMENA_CLIENT_IP_HEADER:-x-forwarded-for}
+      # Behind a proxy that sets the client address in a header (e.g.
+      # x-forwarded-for), name it. It is believed only from these peers;
+      # anyone else is counted by its own address.
+      ALMENA_CLIENT_IP_HEADER: ${ALMENA_CLIENT_IP_HEADER:-}
+      ALMENA_TRUSTED_PROXIES: ${ALMENA_TRUSTED_PROXIES:-127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}
+      ALMENA_RATE_LIMIT_ON_ERROR: ${ALMENA_RATE_LIMIT_ON_ERROR:-closed}
+      ALMENA_RELAY_RATE_LIMIT: ${ALMENA_RELAY_RATE_LIMIT:-600}
       ALMENA_FEDERATION: ${ALMENA_FEDERATION:-true}
       ALMENA_OUTBOUND_ALLOW_INSECURE: ${ALMENA_OUTBOUND_ALLOW_INSECURE:-false}
       ALMENA_PUSH_MODE: ${ALMENA_PUSH_MODE:-off}
@@ -32,18 +44,17 @@ services:
       ALMENA_APNS_TEAM_ID: ${ALMENA_APNS_TEAM_ID:-}
       ALMENA_APNS_TOPIC: ${ALMENA_APNS_TOPIC:-}
       ALMENA_APNS_SANDBOX: ${ALMENA_APNS_SANDBOX:-false}
-      # Not published: scrape it from the Compose network (e.g. 0.0.0.0:9090).
+      # Not published: scrape it from the container network (e.g. 0.0.0.0:9090).
       ALMENA_METRICS_ADDR: ${ALMENA_METRICS_ADDR:-}
       ALMENA_LOG_FORMAT: ${ALMENA_LOG_FORMAT:-json}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
-      # The mediator's private keys (keys.json). Mount a file here to bring your own.
+      # The mediator's private keys (keys.json) and its SQLite databases: the
+      # messages (mediator.db) and the administration (admin.db). Mount a keys
+      # file here to bring your own.
       - mediator-data:/data
       # Push credentials (FCM service account JSON, APNs .p8), read-only.
       - ./secrets:/secrets:ro
-    depends_on:
-      redis:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "almena-mediator", "healthcheck"]
       interval: 10s
@@ -51,59 +62,5 @@ services:
       retries: 3
       start_period: 5s
 
-  caddy:
-    # Caddy with the acme-dns module, for the DNS-01 challenge (Caddyfile).
-    build:
-      dockerfile_inline: |
-        FROM caddy:2-builder-alpine AS builder
-        RUN xcaddy build --with github.com/caddy-dns/acmedns
-        FROM caddy:2-alpine
-        COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-    image: almena-caddy:dev
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # acme-dns credentials (secrets/acme-dns.json, from `task acme-dns`).
-      - ./secrets:/secrets:ro
-      # Certificates and the ACME account, on the host (git-ignored) so they
-      # survive removing the containers and their volumes.
-      - ./caddy:/data
-      - caddy-config:/config
-    depends_on:
-      mediator:
-        condition: service_healthy
-
-  redis:
-    image: redis:8-alpine
-    restart: unless-stopped
-    # AOF so that queued messages survive restarts (docs/didcomm.md §8).
-    # An empty ALMENA_REDIS_PASSWORD leaves Redis without one.
-    command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --appendfsync
-      - everysec
-      - --requirepass
-      - ${ALMENA_REDIS_PASSWORD:-}
-    environment:
-      REDIS_PASSWORD: ${ALMENA_REDIS_PASSWORD:-}
-    ports:
-      # Local access for `task dev`; bound to loopback only.
-      - "127.0.0.1:${ALMENA_REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      # redis-cli refuses an empty REDISCLI_AUTH, so set it only with a password.
-      test: ["CMD-SHELL", "[ -z \"$$REDIS_PASSWORD\" ] || export REDISCLI_AUTH=\"$$REDIS_PASSWORD\"; redis-cli ping | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
 volumes:
   mediator-data:
-  redis-data:
-  caddy-config:
