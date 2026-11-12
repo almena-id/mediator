@@ -7,15 +7,15 @@
     "check": "node --experimental-strip-types check.ts"
   },
   "dependencies": {
-    "@veramo/core": "^7.0.1",
-    "@veramo/did-comm": "^7.0.1",
-    "@veramo/did-manager": "^7.0.1",
-    "@veramo/did-provider-peer": "^7.0.1",
-    "@veramo/did-resolver": "^7.0.1",
-    "@veramo/key-manager": "^7.0.1",
-    "@veramo/kms-local": "^7.0.1",
-    "@veramo/message-handler": "^7.0.1",
+    "@veramo/core": "^7.0.2",
+    "@veramo/did-comm": "^7.0.2",
+    "@veramo/did-manager": "^7.0.2",
+    "@veramo/did-provider-peer": "^7.0.2",
+    "@veramo/did-resolver": "^7.0.2",
+    "@veramo/key-manager": "^7.0.2",
+    "@veramo/kms-local": "^7.0.2",
+    "@veramo/message-handler": "^7.0.2",
     "did-resolver": "^6.0.0",
-    "web-did-resolver": "^2.0.32"
+    "web-did-resolver": "^3.2.0"
   }
 }

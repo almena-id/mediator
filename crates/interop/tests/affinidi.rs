@@ -17,8 +17,9 @@ use affinidi_crypto::jose::key_agreement::{
     Curve as TheirCurve, PrivateKeyAgreement, PublicKeyAgreement,
 };
 use affinidi_messaging_didcomm::jws::sign::JwsSigner;
+use affinidi_messaging_didcomm::jws::verify::VerifyKey;
 use affinidi_messaging_didcomm::message::{forward, pack, unpack as their_unpack};
-use affinidi_messaging_didcomm::{Message as TheirMessage, UnpackResult};
+use affinidi_messaging_didcomm::{Message as TheirMessage, SenderKey, SignerKey, UnpackResult};
 use almena_didcomm::did::DidDocument;
 use almena_didcomm::did::peer::{Purpose, peer2};
 use almena_didcomm::{
@@ -113,12 +114,8 @@ fn opened(result: UnpackResult) -> (TheirMessage, bool, bool) {
         UnpackResult::Encrypted {
             message,
             authenticated,
-            legacy_kek_used,
             ..
-        } => {
-            assert!(!legacy_kek_used, "decrypted only with the legacy KEK");
-            (message, authenticated, true)
-        }
+        } => (message, authenticated, true),
         UnpackResult::Signed { message, .. } => (message, false, false),
         UnpackResult::Plaintext(message) => (message, false, false),
         _ => panic!("unknown unpack result"),
@@ -146,13 +143,16 @@ async fn almena_envelopes_open_with_affinidi() {
                 )
                 .await
                 .unwrap();
-            let sender = from.map(|_| alice.their_public());
+            // The sender's key bound to the `skid` it is named by.
+            let alice_kid = alice.agreement_kid();
+            let alice_public = alice.their_public();
+            let sender = from.map(|_| SenderKey::new(&alice_kid, &alice_public));
             let (message, authenticated, encrypted) = opened(
-                their_unpack::unpack(
+                their_unpack::unpack_bound(
                     &packed.message,
                     Some(&bob.agreement_kid()),
                     Some(&bob.their_private()),
-                    sender.as_ref(),
+                    sender,
                     None,
                 )
                 .unwrap_or_else(|err| panic!("{curve:?} from {from:?}: {err}")),
@@ -181,8 +181,18 @@ async fn almena_envelopes_open_with_affinidi() {
         .as_slice()
         .try_into()
         .unwrap();
-    let (message, _, _) =
-        opened(their_unpack::unpack(&jws, None, None, None, Some(&verifying)).unwrap());
+    let signing_kid = alice.signing_kid();
+    let verifying = VerifyKey::Ed25519(verifying);
+    let (message, _, _) = opened(
+        their_unpack::unpack_bound(
+            &jws,
+            None,
+            None,
+            None,
+            Some(SignerKey::new(&signing_kid, &verifying)),
+        )
+        .unwrap(),
+    );
     assert_eq!(message.body["text"], "firmado");
 }
 
@@ -320,11 +330,11 @@ async fn request(
         other => panic!("{type_}: expected a reply, got {other:?}"),
     };
     let (reply, authenticated, _) = opened(
-        their_unpack::unpack(
+        their_unpack::unpack_bound(
             &reply,
             Some(&bob.agreement_kid()),
             Some(&bob.their_private()),
-            Some(&mediator_public),
+            Some(SenderKey::new(&mediator_kid, &mediator_public)),
             None,
         )
         .unwrap_or_else(|err| panic!("{type_}: reply did not open: {err}")),
@@ -434,11 +444,14 @@ async fn a_mediation_run_with_affinidi_wallets() {
         )
         .unwrap();
         let (received, authenticated, _) = opened(
-            their_unpack::unpack(
+            their_unpack::unpack_bound(
                 &queued,
                 Some(&bob.agreement_kid()),
                 Some(&bob.their_private()),
-                Some(&alice.their_public()),
+                Some(SenderKey::new(
+                    &alice.agreement_kid(),
+                    &alice.their_public(),
+                )),
                 None,
             )
             .unwrap(),
