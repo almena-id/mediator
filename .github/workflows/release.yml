@@ -1,0 +1,189 @@
+# Release: every push to main (an approved pull request merged into it) gets a
+# version, a multi-architecture Docker image and a git tag.
+#
+#   version         year.month.sequence, e.g. 2026.11.1; the sequence restarts
+#                   each month and counts the v<year>.<month>.* tags already made
+#   image           ghcr.io/<owner>/<repo>, linux/amd64 and linux/arm64, each
+#                   built on its own runner (no emulation), tagged:
+#                     <version>       never moves
+#                     latest          the newest build of main
+#                     sha-<commit>    this exact commit (7 characters)
+#   git tag         v<version> on the merged commit, made once the image is
+#                   published, so a tag always has its image
+#
+# The version is compiled in (the Dockerfile's ALMENA_VERSION) and reported by
+# /health. Running it again on a commit that already has a v* tag publishes
+# that same version again instead of making a new one.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One release at a time, never cancelled once running. GitHub keeps one run
+# waiting: a merge whose run is still waiting when another arrives is released
+# within the later one, which holds its commit.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tagged: ${{ steps.version.outputs.tagged }}
+      image: ${{ steps.version.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - id: version
+        name: Work out the version
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          existing=$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)
+          if [ -n "$existing" ]; then
+            version="${existing#v}"
+            tagged=true
+          else
+            month=$(date -u +%Y.%m)
+            last=$(git tag --list "v${month}.*" \
+              | sed -n "s/^v${month//./\\.}\.\([0-9][0-9]*\)$/\1/p" \
+              | sort -n | tail -n1)
+            version="${month}.$(( ${last:-0} + 1 ))"
+            tagged=false
+          fi
+          {
+            echo "version=$version"
+            echo "tagged=$tagged"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version $version (already tagged: $tagged), image $image" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Image (${{ matrix.platform }})
+    needs: version
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        name: Build and push by digest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: ALMENA_VERSION=${{ needs.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          outputs: type=image,name=${{ needs.version.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+
+      - name: Keep the digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish and tag
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      IMAGE: ${{ needs.version.outputs.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag the multi-architecture image
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          sources=()
+          for digest in *; do sources+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create \
+            --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE:latest" \
+            --tag "$IMAGE:sha-${GITHUB_SHA::7}" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+      - uses: actions/checkout@v5
+        if: needs.version.outputs.tagged != 'true'
+
+      - name: Tag the commit
+        if: needs.version.outputs.tagged != 'true'
+        run: |
+          set -euo pipefail
+          git tag "v$VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/v$VERSION"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Released $VERSION"
+            echo
+            echo "- \`$IMAGE:$VERSION\` (also \`latest\`, \`sha-${GITHUB_SHA::7}\`), linux/amd64 + linux/arm64"
+            echo "- git tag \`v$VERSION\` on \`${GITHUB_SHA::7}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
